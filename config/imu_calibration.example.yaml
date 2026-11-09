@@ -1,0 +1,10 @@
+# Yahboom CMP10A 軟體校正參數範例。
+# 複製成 config/imu_calibration.yaml 後由 ROS driver 載入
+# (容器內路徑 /config/imu_calibration.yaml)。
+# 一般不需手動編輯:用 `python3 imu.py` → 4 IMU 校正工具
+#   9  軟體靜態偏移校正 → 寫入 gyro_bias / accel_bias
+#   10 軟體磁力計 hard-iron 校正 → 寫入 mag_offset
+# driver 會以「量測值 - 偏移」修正輸出。
+gyro_bias: [0.0, 0.0, 0.0]     # rad/s
+accel_bias: [0.0, 0.0, 0.0]    # m/s^2
+mag_offset: [0.0, 0.0, 0.0]    # raw LSB

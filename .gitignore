@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+install/
+log/
+# Local software-calibration results; keep only *.example.yaml in git
+config/*.yaml
+!config/*.example.yaml
+.env

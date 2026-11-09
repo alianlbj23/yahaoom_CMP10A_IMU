@@ -1,0 +1,25 @@
+# Only docker/ and wit_ros2_imu/ are needed by docker/Dockerfile.
+.git
+.gitignore
+IMU standard  PC software(V6.2.60)
+10-axis_IMU_Module
+.serena
+.vscode
+docs
+config
+host
+tests
+imu.py
+README.md
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+build
+install
+log
+wit_ros2_imu/build
+wit_ros2_imu/install
+wit_ros2_imu/log
+.env
+**/*.pem
+**/*.key
