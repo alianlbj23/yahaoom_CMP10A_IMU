@@ -265,7 +265,7 @@ def gui_args(platform: str, env: Mapping[str, str]) -> List[str]:
 def build_run_args(platform: str, port: Optional[str], mode: str,
                    expose_lan: bool, repo_dir: str,
                    env: Mapping[str, str],
-                   realpath_func: Callable[[str], str] = os.path.realpath
+                   realpath_func: Optional[Callable[[str], str]] = None
                    ) -> List[str]:
     """Return the full ``docker run`` argument list.
 
@@ -292,7 +292,8 @@ def build_run_args(platform: str, port: Optional[str], mode: str,
     if port:
         inner_port = container_port(platform, port)
         if platform != 'mac':
-            args += ['--device', '%s:%s' % (realpath_func(port), port)]
+            resolve = realpath_func or os.path.realpath
+            args += ['--device', '%s:%s' % (resolve(port), port)]
     if mode in GUI_MODES:
         args += gui_args(platform, env)
     args.append(IMAGE)
