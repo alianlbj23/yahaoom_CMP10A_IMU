@@ -192,20 +192,19 @@ def test_detect_platform_unsupported():
 
 # ------------------------------------------------------ serial port listing
 def test_list_serial_ports_linux_resolves_and_dedupes():
-    """Resolve by-id / imu_usb symlinks and merge them with the device."""
+    """Resolve by-id symlinks and merge them with the device."""
     by_id = '/dev/serial/by-id/usb-Silicon_Labs_CP2102-if00-port0'
     tree = {
         '/dev/serial/by-id/*': [by_id],
-        '/dev/imu_usb': ['/dev/imu_usb'],
         '/dev/ttyUSB*': ['/dev/ttyUSB0'],
         '/dev/ttyACM*': ['/dev/ttyACM0'],
     }
-    links = {by_id: '/dev/ttyUSB0', '/dev/imu_usb': '/dev/ttyUSB0'}
+    links = {by_id: '/dev/ttyUSB0'}
     ports = imu.list_serial_ports(
         'linux', glob_func=lambda pattern: tree.get(pattern, []),
         realpath_func=lambda p: links.get(p, p))
     assert [p.device for p in ports] == ['/dev/ttyUSB0', '/dev/ttyACM0']
-    assert set(ports[0].aliases) == {by_id, '/dev/imu_usb'}
+    assert set(ports[0].aliases) == {by_id}
     assert ports[1].aliases == ()
     assert 'by-id' in ports[0].label
 
@@ -353,13 +352,15 @@ def _has_pair(args, flag, value):
 
 # ----------------------------------------------------- permission handling
 def test_check_port_access_denied_explains_fix():
-    """Explain dialout / udev rules when the port is not accessible."""
+    """Point to usb_udev_namer / dialout when the port is not accessible."""
     with pytest.raises(imu.LauncherError) as excinfo:
         imu.check_port_access('/dev/ttyUSB0',
                               access_func=lambda p, m: False)
     message = str(excinfo.value)
+    assert 'usb_udev_namer' in message
+    assert '/dev/usb_imu' in message
     assert 'dialout' in message
-    assert 'imu_usb.rules' in message
+    assert 'imu_usb.rules' not in message
 
 
 def test_check_port_access_ok():
@@ -402,15 +403,14 @@ def test_ask_choice_validates_range():
 
 # ------------------------------------------------------- start: error paths
 def test_start_wsl_without_ports_prints_usbipd_steps(docker, capsys):
-    """Guide WSL users through usbipd-win when no device is attached."""
+    """Guide WSL users to wsl_usb_auto when no device is attached."""
     launcher = make_launcher(platform='wsl', ports=[])
     with pytest.raises(imu.LauncherError):
         launcher.start('foxglove')
     out = capsys.readouterr().out
     assert 'winget install usbipd' in out
-    assert 'usbipd list' in out
-    assert 'usbipd bind --busid' in out
-    assert 'usbipd attach --wsl --busid' in out
+    assert 'wsl_usb_auto' in out
+    assert 'usb_udev_namer' in out
     assert 'run' not in docker.subcommands()
 
 
@@ -645,3 +645,60 @@ def test_check_environment_without_docker(docker, capsys):
     problems = make_launcher(ports=[]).check_environment()
     assert any('docker' in p for p in problems)
     assert any('序列埠' in p for p in problems)
+
+
+def test_list_serial_ports_prefers_usb_imu_name():
+    """A /dev/usb_imu symlink is listed first and used as the selected path."""
+    tree = {
+        '/dev/usb_imu': ['/dev/usb_imu'],
+        '/dev/ttyUSB*': ['/dev/ttyUSB0', '/dev/ttyUSB1'],
+    }
+    links = {'/dev/usb_imu': '/dev/ttyUSB1'}
+    ports = imu.list_serial_ports(
+        'linux', glob_func=lambda pattern: tree.get(pattern, []),
+        realpath_func=lambda path: links.get(path, path))
+    assert [p.device for p in ports] == ['/dev/ttyUSB1', '/dev/ttyUSB0']
+    assert ports[0].selected == '/dev/usb_imu'
+    assert ports[0].label == '/dev/usb_imu'
+    assert ports[1].selected == '/dev/ttyUSB0'
+
+
+def test_serial_port_without_usb_imu_selects_device():
+    """Without the fixed name the resolved device is used, as before."""
+    port = imu.SerialPort('/dev/ttyUSB0', ('/dev/serial/by-id/x',))
+    assert port.selected == '/dev/ttyUSB0'
+
+
+def test_build_run_args_maps_device_to_fixed_name():
+    """Map the resolved host device to the fixed name in the container."""
+    args = imu.build_run_args(
+        'linux', '/dev/usb_imu', 'foxglove', False, '/repo', {},
+        realpath_func=lambda path: '/dev/ttyUSB1')
+    assert '/dev/ttyUSB1:/dev/usb_imu' in args
+    assert 'port:=/dev/usb_imu' in args
+
+
+def test_start_passes_usb_imu_name_into_container(docker, tmp_path,
+                                                  monkeypatch, capsys):
+    """Choosing the usb_imu port makes the driver use /dev/usb_imu."""
+    monkeypatch.setattr(imu.os.path, 'realpath', lambda path: '/dev/ttyUSB0'
+                        if path == '/dev/usb_imu' else path)
+    ports = [imu.SerialPort('/dev/ttyUSB1'),
+             imu.SerialPort('/dev/ttyUSB0', ('/dev/usb_imu',))]
+    # Only the LAN question is asked: the fixed name is used without a menu.
+    launcher = make_launcher(answers=['n'], ports=ports, tmp_path=tmp_path)
+    launcher.start('foxglove')
+    out = capsys.readouterr().out
+    assert '使用 /dev/usb_imu' in out
+    assert '可用序列埠' not in out
+    assert '/dev/ttyUSB1' not in out
+    args = docker.run_call()[0]
+    assert '/dev/ttyUSB0:/dev/usb_imu' in args
+    assert 'port:=/dev/usb_imu' in args
+
+
+def test_no_port_message_points_to_naming_tool():
+    """The Linux hint names the fixed device name and the naming tool."""
+    message = imu.no_port_message('linux')
+    assert '/dev/usb_imu' in message
+    assert 'usb_udev_namer' in message

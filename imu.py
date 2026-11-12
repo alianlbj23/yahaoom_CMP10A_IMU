@@ -58,7 +58,11 @@ SESSION_TIMEOUT = 24 * 3600   # foreground session; normally ended by Ctrl+C
 BRIDGE_STARTUP_WAIT = 1.0
 BRIDGE_STOP_TIMEOUT = 5
 
-LINUX_PORT_GLOBS = ('/dev/serial/by-id/*', '/dev/imu_usb', '/dev/ttyUSB*',
+# Fixed device name created with usb_udev_namer (see tutorial unit 0).
+PREFERRED_PORT = '/dev/usb_imu'
+NAMER_URL = 'https://github.com/alianlbj23/usb_udev_namer'
+WSL_ATTACH_URL = 'https://github.com/alianlbj23/wsl_usb_auto'
+LINUX_PORT_GLOBS = (PREFERRED_PORT, '/dev/serial/by-id/*', '/dev/ttyUSB*',
                     '/dev/ttyACM*')
 MAC_PORT_GLOBS = ('/dev/cu.usbserial*', '/dev/cu.SLAB*',
                   '/dev/cu.wchusbserial*')
@@ -88,17 +92,28 @@ class SerialPort(NamedTuple):
     aliases: Tuple[str, ...] = ()
 
     @property
+    def selected(self) -> str:
+        """Return the path to use: the fixed name if present."""
+        if PREFERRED_PORT in self.aliases:
+            return PREFERRED_PORT
+        return self.device
+
+    @property
     def label(self) -> str:
         """Return a human readable description."""
-        if not self.aliases:
-            return self.device
+        if self.selected != self.device:
+            return self.selected
+        head = self.device
+        others = self.aliases
+        if not others:
+            return head
         names = []
-        for alias in self.aliases:
+        for alias in others:
             if alias.startswith('/dev/serial/by-id/'):
                 names.append('by-id: ' + os.path.basename(alias))
             else:
                 names.append(alias)
-        return '%s (%s)' % (self.device, ', '.join(names))
+        return '%s (%s)' % (head, ', '.join(names))
 
 
 # ---------------------------------------------------------------- platform
@@ -144,13 +159,12 @@ def permission_hint(device: str) -> str:
     """Explain how to get read/write access to a serial device."""
     return '\n'.join((
         '目前使用者沒有 %s 的讀寫權限。擇一處理:' % device,
-        '  (a) 加入 dialout 群組後重新登入 (WSL: 在 PowerShell 執行 '
+        '  (a) 用 usb_udev_namer 把 IMU 命名為 %s (同時開放讀寫權限):'
+        % PREFERRED_PORT,
+        '        %s' % NAMER_URL,
+        '  (b) 加入 dialout 群組後重新登入 (WSL: 在 PowerShell 執行 '
         'wsl --shutdown 再開):',
         '        sudo usermod -aG dialout "$USER"',
-        '  (b) 安裝 repo 內的 udev 規則 wit_ros2_imu/imu_usb.rules '
-        '(建立 /dev/imu_usb):',
-        '        cd wit_ros2_imu && bash bind_usb.sh',
-        '      之後重新插拔 IMU。',
     ))
 
 
@@ -163,15 +177,16 @@ def check_port_access(device: str,
 
 
 def usbipd_instructions() -> str:
-    """Return the usbipd-win steps to attach a USB device to WSL2."""
+    """Return the steps to attach a USB device to WSL2 and name it."""
     return '\n'.join((
-        'WSL2 看不到 USB 序列埠。請在 Windows PowerShell (系統管理員) 執行:',
-        '  winget install usbipd',
-        '  usbipd list                          # 找到 CP2102 的 BUSID, '
-        '例如 2-3',
-        '  usbipd bind --busid <id>             # 只需做一次',
-        '  usbipd attach --wsl --busid <id>     # 每次插拔後都要重做',
-        '完成後在 WSL 內執行 ls /dev/ttyUSB* 確認,再重新選擇。',
+        'WSL2 看不到 USB 序列埠。請依序處理:',
+        '  1. Windows PowerShell 安裝 usbipd-win (只需一次,裝完重開 WSL):',
+        '       winget install usbipd',
+        '  2. 在 WSL 內用 wsl_usb_auto 把 IMU 綁定進 WSL (之後插上自動掛載):',
+        '       %s' % WSL_ATTACH_URL,
+        '  3. 用 usb_udev_namer 把 IMU 命名為 %s:' % PREFERRED_PORT,
+        '       %s' % NAMER_URL,
+        '完成後執行 ls -l %s 確認,再重新選擇。' % PREFERRED_PORT,
     ))
 
 
@@ -181,8 +196,10 @@ def no_port_message(platform: str) -> str:
         return ('找不到序列埠 (/dev/cu.usbserial* / /dev/cu.SLAB* / '
                 '/dev/cu.wchusbserial*)。請確認 IMU 已插上,'
                 '必要時安裝 CP210x 驅動。')
-    return ('找不到序列埠 (/dev/serial/by-id/*、/dev/ttyUSB*、'
-            '/dev/ttyACM*)。請確認 IMU 已插上。')
+    return ('找不到序列埠 (%s、/dev/serial/by-id/*、/dev/ttyUSB*、'
+            '/dev/ttyACM*)。請確認 IMU 已插上。\n'
+            '固定裝置名稱 %s 可用 usb_udev_namer 建立: %s'
+            % (PREFERRED_PORT, PREFERRED_PORT, NAMER_URL))
 
 
 # ---------------------------------------------------------- docker run args
@@ -245,12 +262,15 @@ def gui_args(platform: str, env: Mapping[str, str]) -> List[str]:
 
 def build_run_args(platform: str, port: Optional[str], mode: str,
                    expose_lan: bool, repo_dir: str,
-                   env: Mapping[str, str]) -> List[str]:
-    """Return the full ``docker run`` argument list (pure function).
+                   env: Mapping[str, str],
+                   realpath_func: Callable[[str], str] = os.path.realpath
+                   ) -> List[str]:
+    """Return the full ``docker run`` argument list.
 
-    ``port`` is the host serial device (already resolved, e.g.
-    ``/dev/ttyUSB0`` or ``/dev/cu.usbserial-0001``); it may be None only in
-    shell mode.
+    ``port`` is the host serial path (e.g. ``/dev/usb_imu``, ``/dev/ttyUSB0``
+    or ``/dev/cu.usbserial-0001``); it may be None only in shell mode.  On
+    Linux / WSL the resolved host device is mapped into the container under
+    the same name as ``port``, so a fixed name stays visible to the driver.
     """
     if platform not in PLATFORMS:
         raise LauncherError('未知的平台 %r' % platform)
@@ -270,7 +290,7 @@ def build_run_args(platform: str, port: Optional[str], mode: str,
     if port:
         inner_port = container_port(platform, port)
         if platform != 'mac':
-            args += ['--device', '%s:%s' % (port, port)]
+            args += ['--device', '%s:%s' % (realpath_func(port), port)]
     if mode in GUI_MODES:
         args += gui_args(platform, env)
     args.append(IMAGE)
@@ -554,7 +574,7 @@ class Launcher:
                 ok, detail = True, '可用'
             else:
                 ok = bool(self.access_func(item.device, os.R_OK | os.W_OK))
-                detail = '可讀寫' if ok else '沒有讀寫權限 (dialout / udev)'
+                detail = '可讀寫' if ok else '沒有讀寫權限 (usb_udev_namer / dialout)'
             self._report(ok, '序列埠 %s' % item.label, detail, problems)
         self._report_display(problems)
         if self.platform == 'mac':
@@ -604,11 +624,14 @@ class Launcher:
                 print('[注意] 沒有序列埠,容器將不帶 IMU 裝置啟動。')
                 return None
             raise LauncherError(no_port_message(self.platform))
+        if any(item.selected == PREFERRED_PORT for item in ports):
+            print('\n使用 %s' % PREFERRED_PORT)
+            return PREFERRED_PORT
         print('\n可用序列埠:')
         for index, item in enumerate(ports, start=1):
             print('  %d) %s' % (index, item.label))
         choice = self.ask_choice('選擇序列埠', 1, len(ports))
-        device = ports[choice - 1].device
+        device = ports[choice - 1].selected
         if not device.startswith('/dev/'):
             raise LauncherError('不合法的序列埠路徑: %r' % device)
         return device

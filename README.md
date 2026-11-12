@@ -67,29 +67,26 @@ IMU 預設 9600 baud,約 10 Hz 輸出加速度、角速度、角度、磁力計�
 
 1. 安裝 Docker Engine,並把自己加入 docker 群組:
    `sudo usermod -aG docker "$USER"`(重新登入生效)。
-2. 序列埠權限(擇一):
-   - 加入 dialout 群組:`sudo usermod -aG dialout "$USER"`,重新登入。
-   - 或安裝 repo 內的 udev 規則(建立 `/dev/imu_usb` 並開放權限):
-     ```bash
-     cd wit_ros2_imu && bash bind_usb.sh   # 會用 sudo 複製 imu_usb.rules
-     ```
-     之後重新插拔 IMU。`imu.py` 會把 `/dev/imu_usb`、`/dev/serial/by-id/*`
-     等 symlink 解析成實際的 `/dev/ttyUSBx` 再傳入容器。
+2. 固定 IMU 的裝置名稱:用 [usb_udev_namer](https://github.com/alianlbj23/usb_udev_namer) 把 IMU 命名為 `usb_imu`,
+   之後一律使用 `/dev/usb_imu`。命名時會一併開放讀寫權限,不需另外加入 dialout 群組。
+   ```bash
+   git clone https://github.com/alianlbj23/usb_udev_namer.git
+   python3 usb_udev_namer/usb_udev_namer.py     # 選 1 Name a device,名稱輸入 usb_imu
+   ls -l /dev/usb_imu                           # 應顯示 /dev/usb_imu -> ttyUSB0
+   ```
 3. RViz2(選用):需要 X11 桌面(有 `DISPLAY`)。若視窗打不開,可能需要在主機執行
    `xhost +local:docker`(`imu.py` 只提示,不會自動執行)。
 
 ### Windows 11 / WSL2
 
 1. 安裝 WSL2(Ubuntu)與 Docker(Docker Desktop 的 WSL 整合,或在 WSL 內安裝 Docker Engine)。
-2. 用 **usbipd-win** 把 IMU 接到 WSL。在 **Windows PowerShell(系統管理員)**:
-   ```powershell
-   winget install usbipd
-   usbipd list                          # 找到 "CP210x USB to UART" 的 BUSID,例如 2-3
-   usbipd bind --busid <id>             # 只需做一次
-   usbipd attach --wsl --busid <id>     # 每次插拔 IMU 或重開機後都要重做
+2. 把 IMU 綁定進 WSL:在 Windows PowerShell 安裝 usbipd-win(`winget install usbipd`,裝完重開 WSL),
+   再於 WSL 內用 [wsl_usb_auto](https://github.com/alianlbj23/wsl_usb_auto) 新增自動掛載規則,之後 IMU 插上就自動進入 WSL。
+   ```bash
+   git clone https://github.com/alianlbj23/wsl_usb_auto.git
+   python3 wsl_usb_auto/wsl_usb_auto.py         # 選 1 新增自動掛載裝置
    ```
-   在 WSL 內確認:`ls -l /dev/ttyUSB* /dev/serial/by-id/`。
-3. 序列埠權限同 Linux(dialout 群組;改群組後在 PowerShell 執行 `wsl --shutdown` 再重開 WSL)。
+3. 固定 IMU 的裝置名稱:同 Linux 第 2 點,用 `usb_udev_namer` 命名為 `usb_imu`。
 4. RViz2 使用 **WSLg**(Windows 11 內建),不需另裝 X server。`imu.py` 會自動帶入
    `/tmp/.X11-unix`、`/mnt/wslg`、`DISPLAY`、`WAYLAND_DISPLAY`、
    `XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir`、`PULSE_SERVER`(變數存在才帶)。
@@ -148,11 +145,13 @@ python3 imu.py
 
 1. 檢查 docker daemon 與映像。
 2. 列出序列埠讓你選:
-   - Linux / WSL:`/dev/serial/by-id/*`、`/dev/imu_usb`、`/dev/ttyUSB*`、`/dev/ttyACM*`
-     (symlink 會解析成實際裝置,例如 `/dev/ttyUSB0`),並以
+   - Linux / WSL:`/dev/usb_imu`、`/dev/serial/by-id/*`、`/dev/ttyUSB*`、`/dev/ttyACM*`。
+     已用 [usb_udev_namer](https://github.com/alianlbj23/usb_udev_namer) 建立固定名稱時,不顯示清單,
+     直接使用 `/dev/usb_imu`,以 `--device /dev/ttyUSB0:/dev/usb_imu` 傳入容器,driver 使用 `/dev/usb_imu`。
+     沒有固定名稱時,其他 symlink 會解析成實際裝置(例如 `/dev/ttyUSB0`),以
      `--device /dev/ttyUSB0:/dev/ttyUSB0` 傳入容器,容器內用同一路徑。
-     若目前使用者沒有讀寫權限會中止並說明 dialout / udev 的處理方式。
-   - WSL 找不到裝置時會印出 usbipd-win 步驟。
+     若目前使用者沒有讀寫權限會中止並說明處理方式(用 `usb_udev_namer` 命名,或加入 dialout 群組)。
+   - WSL 找不到裝置時會印出 `wsl_usb_auto` 與 `usb_udev_namer` 的步驟。
    - macOS:`/dev/cu.usbserial*`、`/dev/cu.SLAB*`、`/dev/cu.wchusbserial*`;
      容器啟動前在背景啟動序列埠橋接(log:`$TMPDIR/yahboom-imu-bridge.log`),容器結束後自動停止。
 3. 詢問**是否開放區網**(預設否):
@@ -464,18 +463,17 @@ driver 參數:`port`(預設 `/dev/ttyUSB0`,可為 pyserial URL)、`baud`(9600)�
 
 ### 序列埠權限 `Permission denied` / `imu.py` 提示沒有讀寫權限
 
+用 [usb_udev_namer](https://github.com/alianlbj23/usb_udev_namer) 把 IMU 命名為 `usb_imu`,規則會一併開放讀寫權限。
+不使用固定名稱時,改為加入 dialout 群組:
+
 ```bash
-ls -l /dev/ttyUSB0          # crw-rw---- root dialout ...
-groups                      # 需要包含 dialout
 sudo usermod -aG dialout "$USER"   # 然後重新登入(WSL:wsl --shutdown)
 ```
 
-或安裝 udev 規則:`cd wit_ros2_imu && bash bind_usb.sh`,重新插拔後會出現 `/dev/imu_usb`。
+### WSL 看不到 `/dev/ttyUSB*` 或 `/dev/usb_imu`
 
-### WSL 看不到 `/dev/ttyUSB*`
-
-- 在 PowerShell(系統管理員)重做 `usbipd attach --wsl --busid <id>`(每次插拔/重開機都要)。
-- `usbipd list` 中狀態應為 `Attached`;若是 `Shared` 代表尚未 attach。
+- 執行 [wsl_usb_auto](https://github.com/alianlbj23/wsl_usb_auto),選「查看所有規則」確認 IMU 的規則存在且監聽已啟動。
+- `/dev/ttyUSB0` 存在但 `/dev/usb_imu` 不存在:在 `usb_udev_namer` 選 `4 Re-apply the rules`;WSL 未啟動 udev 時先執行 `sudo service udev restart`。
 - 若被 Windows 程式(例如 WitMotion 上位機)開著,先關閉它。
 - WSL 核心太舊時更新:PowerShell 執行 `wsl --update`。
 

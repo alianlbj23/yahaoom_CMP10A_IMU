@@ -127,7 +127,8 @@ rosbridge_websocket port 9090、foxglove_bridge port 8765,皆 address 0.0.0.0(�
 選單:1 建置映像 2 啟動 IMU + Foxglove bridges 3 啟動 IMU + RViz2(+ bridges)4 IMU 校正工具
 5 進入容器 shell 6 停止容器 7 環境檢查 0 離開。
 - 序列埠:linux/wsl 列出 `/dev/serial/by-id/*`、`/dev/ttyUSB*`、`/dev/ttyACM*` 讓使用者選,`--device` 傳入容器並以
-  容器內 `/dev/ttyUSB0`…原路徑使用;WSL 找不到裝置時印出 usbipd-win 指引
+  容器內 `/dev/ttyUSB0`…原路徑使用;有 `/dev/usb_imu`(usb_udev_namer 建立)時排第一,並以該名稱傳入容器;
+  WSL 找不到裝置時印出 wsl_usb_auto 與 usb_udev_namer 指引
 - mac:列出 `/dev/cu.usbserial*`、`/dev/cu.SLAB*`、`/dev/cu.wchusbserial*`;背景啟動 `host/serial_tcp_bridge.py`
   (綁 127.0.0.1:5760),容器 port 參數 `socket://host.docker.internal:5760`;缺 pyserial 時提示 `pip install pyserial==3.5`
 - GUI:linux → DISPLAY + `/tmp/.X11-unix`;wsl → WSLg(`/tmp/.X11-unix`、`/mnt/wslg`、WAYLAND_DISPLAY、XDG_RUNTIME_DIR);
