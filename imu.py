@@ -36,7 +36,9 @@ import time
 from typing import Callable, Dict, List, Mapping, NamedTuple, Optional
 from typing import Sequence, Tuple
 
-IMAGE = 'yahboom-imu:jazzy'
+# Built and published by .github/workflows/docker-image.yml; never built
+# locally by this launcher.
+IMAGE = 'ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy'
 CONTAINER_NAME = 'yahboom-imu'
 ROSBRIDGE_PORT = 9090
 FOXGLOVE_PORT = 8765
@@ -51,7 +53,7 @@ MODES = ('foxglove', 'rviz', 'calibrate', 'shell')
 GUI_MODES = ('rviz', 'shell')
 PUBLISH_MODES = ('foxglove', 'rviz', 'shell')
 
-BUILD_TIMEOUT = 3600          # docker build may download ~1 GB
+PULL_TIMEOUT = 3600           # docker pull downloads 2-3 GB
 DOCKER_TIMEOUT = 30           # docker info / inspect / ps
 STOP_TIMEOUT = 60             # docker stop (10 s grace + margin)
 SESSION_TIMEOUT = 24 * 3600   # foreground session; normally ended by Ctrl+C
@@ -70,7 +72,7 @@ MAC_PORT_GLOBS = ('/dev/cu.usbserial*', '/dev/cu.SLAB*',
 PYSERIAL_HINT = 'python3 -m pip install pyserial==3.5'
 
 MENU = (
-    ('1', '建置 Docker 映像 (%s)' % IMAGE),
+    ('1', '下載 Docker 映像 (%s)' % IMAGE),
     ('2', '啟動 IMU + Foxglove bridges (rosbridge 9090 / foxglove 8765)'),
     ('3', '啟動 IMU + RViz2 (+ bridges)'),
     ('4', 'IMU 校正工具'),
@@ -446,7 +448,7 @@ class Launcher:
     def run_menu(self) -> int:
         """Run the menu loop and return the process exit code."""
         actions = {
-            1: self.build_image,
+            1: self.pull_image,
             2: lambda: self.start('foxglove'),
             3: lambda: self.start('rviz'),
             4: lambda: self.start('calibrate'),
@@ -476,20 +478,17 @@ class Launcher:
             return 130
 
     # ------------------------------------------------------------ actions
-    def build_image(self) -> None:
-        """Build the Docker image from docker/Dockerfile."""
-        dockerfile = os.path.join(self.repo_dir, 'docker', 'Dockerfile')
-        if not os.path.isfile(dockerfile):
-            raise LauncherError('找不到 %s' % dockerfile)
+    def pull_image(self) -> None:
+        """Download the prebuilt image published by GitHub Actions."""
         self._require_daemon()
-        print('建置 %s (第一次約需 10-20 分鐘)...' % IMAGE)
-        result = docker(['build', '-t', IMAGE, '-f', dockerfile,
-                         self.repo_dir], timeout=BUILD_TIMEOUT,
-                        capture=False)
+        print('下載 %s (約 2-3 GB,視網路速度需數分鐘)...' % IMAGE)
+        result = docker(['pull', IMAGE], timeout=PULL_TIMEOUT, capture=False)
         if result.returncode != 0:
-            raise LauncherError('docker build 失敗 (exit %d)'
-                                % result.returncode)
-        print('映像 %s 建置完成。' % IMAGE)
+            raise LauncherError(
+                'docker pull %s 失敗 (exit %d)。請確認網路連線,'
+                '以及該映像已由 GitHub Actions 建置並設為公開。'
+                % (IMAGE, result.returncode))
+        print('映像 %s 下載完成。' % IMAGE)
 
     def stop_container(self) -> None:
         """Stop the running container, if any."""
@@ -508,7 +507,7 @@ class Launcher:
                                 '請直接在終端機執行 python3 imu.py。')
         self._require_daemon()
         if not image_exists():
-            raise LauncherError('映像 %s 尚未建置,請先選 1 建置映像。'
+            raise LauncherError('映像 %s 尚未下載,請先選 1 下載映像。'
                                 % IMAGE)
         port = self._select_port(mode)
         if port is not None:
@@ -559,7 +558,7 @@ class Launcher:
         if daemon_ok:
             built = image_exists()
             self._report(built, '映像 %s' % IMAGE,
-                         '已建置' if built else '尚未建置 (選 1)', problems)
+                         '已下載' if built else '尚未下載 (選 1)', problems)
             running = container_running()
             state = '執行中' if running else '未執行'
             print('[--] 容器 %s: %s' % (CONTAINER_NAME, state))

@@ -32,7 +32,7 @@ Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
  └──────────┘        │        │ --device                │ host/serial_tcp_   │
                      │        │                         │ bridge.py          │
                      │        ▼                         ▼ 127.0.0.1:5760     │
-                     │  ┌─────────── docker: yahboom-imu (yahboom-imu:jazzy) ┐│
+                     │  ┌─────────── docker: yahboom-imu (ghcr.io 預建映像) ─┐│
                      │  │ wit_ros2_imu driver → /imu/data, /imu/mag, TF ...  ││
                      │  │ rosbridge :9090   foxglove_bridge :8765   RViz2    ││
                      │  └────────────────────────────────────────────────────┘│
@@ -41,7 +41,8 @@ Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
                      └──────────────────────────────────────────────────────┘
 ```
 
-- 映像:`yahboom-imu:jazzy`(`docker/Dockerfile`,FROM `ros:jazzy-ros-base`)
+- 映像:`ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy`,由 GitHub Actions 依 `docker/Dockerfile`(FROM `ros:jazzy-ros-base`)
+  建置並發佈到 GitHub Container Registry,支援 amd64 與 arm64。使用者一律下載這個預建映像,不在本機建置
 - 容器名:`yahboom-imu`(`--rm`,結束即刪除)
 - `./config` 掛載到容器 `/config`,軟體校正結果存在 `config/imu_calibration.yaml`
 - macOS 的 Docker Desktop 無法把 USB 序列埠傳進容器,因此由主機端
@@ -60,7 +61,7 @@ IMU 預設 9600 baud,約 10 Hz 輸出加速度、角速度、角度、磁力計�
 |---|---|
 | Docker | 可執行 `docker info`(使用者需能不加 sudo 使用 docker) |
 | Python | 3.8 以上,`imu.py` 只用標準函式庫 |
-| 磁碟 | 映像約 2–3 GB,第一次建置需下載套件 |
+| 磁碟 | 映像約 2–3 GB,第一次使用需下載 |
 | Foxglove(選用) | [app.foxglove.dev](https://app.foxglove.dev) 或 Foxglove 桌面版 |
 
 ### Linux(Ubuntu 22.04 / 24.04 等)
@@ -118,7 +119,7 @@ python3 imu.py
 
 ```
 === Yahboom CMP10A IMU (wsl) ===
-  1) 建置 Docker 映像 (yahboom-imu:jazzy)
+  1) 下載 Docker 映像 (ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy)
   2) 啟動 IMU + Foxglove bridges (rosbridge 9090 / foxglove 8765)
   3) 啟動 IMU + RViz2 (+ bridges)
   4) IMU 校正工具
@@ -131,15 +132,15 @@ python3 imu.py
 
 | 選項 | 做什麼 |
 |---|---|
-| 1 建置映像 | `docker build -t yahboom-imu:jazzy -f docker/Dockerfile .`(第一次約 10–20 分鐘,上限 1 小時) |
+| 1 下載映像 | `docker pull ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy`(約 2–3 GB,上限 1 小時)。映像由 GitHub Actions 預先建置 |
 | 2 Foxglove | 容器內執行 `ros2 launch wit_ros2_imu imu.launch.py port:=<埠> rviz:=false`,啟動 driver + rosbridge(9090)+ foxglove_bridge(8765) |
 | 3 RViz2 | 同上但 `rviz:=true`,另開 RViz2 視窗;沒有 `DISPLAY` 時會警告並建議改用 Foxglove |
 | 4 校正工具 | `ros2 run wit_ros2_imu imu_calibrate --port <埠> --baud 9600 --config /config/imu_calibration.yaml`(見[校正流程](#校正流程)) |
 | 5 容器 shell | `bash`,ROS 環境已 source;有序列埠時一併傳入 |
 | 6 停止容器 | `docker stop yahboom-imu` |
-| 7 環境檢查 | 平台、docker daemon、映像是否已建置、容器狀態、序列埠與權限、DISPLAY、(macOS)pyserial |
+| 7 環境檢查 | 平台、docker daemon、映像是否已下載、容器狀態、序列埠與權限、DISPLAY、(macOS)pyserial |
 
-建議第一次使用:**7 環境檢查 → 1 建置映像 → 2 啟動 Foxglove**。
+建議第一次使用:**7 環境檢查 → 1 下載映像 → 2 啟動 Foxglove**。
 
 啟動流程(選項 2–5)會依序:
 
@@ -509,9 +510,9 @@ ss -ltnp | grep -E '8765|9090'     # Linux / WSL
 - Linux / WSL(Docker Engine):`sudo service docker start`,確認使用者在 docker 群組。
 - Docker Desktop:確認已啟動;WSL 需在 Settings → Resources → WSL integration 啟用該發行版。
 
-### 映像尚未建置
+### 映像尚未下載
 
-選單選 **1**。建置 context 為 repo 根目錄(`.dockerignore` 只送出 `docker/` 與 `wit_ros2_imu/`)。
+選單選 **1** 下載預建映像。下載失敗時確認網路連線,以及 GitHub 上該映像(Packages)已設為公開。
 
 ---
 
@@ -523,9 +524,15 @@ python3 -m pytest tests -q
 python3 -m flake8 imu.py host tests
 
 # ROS 套件測試(容器內)
-docker run --rm yahboom-imu:jazzy bash -c \
+docker run --rm ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy bash -c \
   'cd /ws && colcon test --packages-select wit_ros2_imu && colcon test-result --verbose'
 ```
+
+### Docker 映像的建置
+
+映像由 `.github/workflows/docker-image.yml` 建置:`docker/`、`wit_ros2_imu/`、`.dockerignore` 或該 workflow 有變更並 push 到 `main` 時自動執行,
+也可在 GitHub 的 Actions 頁面手動觸發(Run workflow)。產出 `linux/amd64` 與 `linux/arm64` 兩種架構,
+標籤為 `jazzy`(最新)與 `sha-<commit>`。修改 driver 或 Dockerfile 後,須等 workflow 完成,再用 `imu.py` 選 1 重新下載。
 
 目錄結構:
 

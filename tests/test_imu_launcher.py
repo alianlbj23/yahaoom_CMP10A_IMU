@@ -48,6 +48,7 @@ class FakeDocker:
         self.image = image
         self.running = running
         self.run_rc = run_rc
+        self.pull_rc = 0
         self.missing = missing
 
     def __call__(self, args, **kwargs):
@@ -73,8 +74,8 @@ class FakeDocker:
         if sub == 'stop':
             self.running = False
             return subprocess.CompletedProcess(args, 0, '', '')
-        if sub == 'build':
-            return subprocess.CompletedProcess(args, 0)
+        if sub == 'pull':
+            return subprocess.CompletedProcess(args, self.pull_rc)
         raise AssertionError('unexpected docker call: %r' % (args,))
 
     def subcommands(self):
@@ -238,7 +239,7 @@ def test_build_run_args_linux_foxglove():
         '-p', '127.0.0.1:9090:9090', '-p', '127.0.0.1:8765:8765',
         '-v', '/repo/config:/config',
         '--device', '/dev/ttyUSB0:/dev/ttyUSB0',
-        'yahboom-imu:jazzy',
+        'ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy',
         'ros2', 'launch', 'wit_ros2_imu', 'imu.launch.py',
         'port:=/dev/ttyUSB0', 'rviz:=false',
     ]
@@ -309,7 +310,7 @@ def test_build_run_args_calibrate():
     """Run the calibration CLI with the mounted YAML path."""
     args = imu.build_run_args('wsl', '/dev/ttyUSB0', 'calibrate', False,
                               REPO, {'DISPLAY': ':0'})
-    image_at = args.index('yahboom-imu:jazzy')
+    image_at = args.index('ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy')
     assert args[image_at + 1:] == [
         'ros2', 'run', 'wit_ros2_imu', 'imu_calibrate',
         '--port', '/dev/ttyUSB0', '--baud', '9600',
@@ -329,7 +330,7 @@ def test_build_run_args_shell_without_port():
     """Allow entering a shell without a serial device."""
     args = imu.build_run_args('linux', None, 'shell', False, REPO, {})
     assert '--device' not in args
-    assert args[-2:] == ['yahboom-imu:jazzy', 'bash']
+    assert args[-2:] == ['ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy', 'bash']
 
 
 @pytest.mark.parametrize('platform,mode,port', [
@@ -432,12 +433,12 @@ def test_start_without_permission_aborts(docker):
 
 
 def test_start_requires_built_image(docker):
-    """Ask the user to build the image first."""
+    """Ask the user to download the image first."""
     docker.image = False
     launcher = make_launcher(answers=['1', 'n'])
     with pytest.raises(imu.LauncherError) as excinfo:
         launcher.start('foxglove')
-    assert '建置' in str(excinfo.value)
+    assert '下載' in str(excinfo.value)
 
 
 def test_start_requires_docker_daemon(docker):
@@ -595,24 +596,36 @@ def test_start_mac_stops_bridge_on_ctrl_c(docker, monkeypatch, tmp_path):
 
 
 # ----------------------------------------------------- other menu actions
-def test_build_image_requires_dockerfile(docker, tmp_path):
-    """Fail when docker/Dockerfile is missing."""
-    launcher = make_launcher(tmp_path=tmp_path)
-    with pytest.raises(imu.LauncherError):
-        launcher.build_image()
+def test_image_is_prebuilt_on_ghcr():
+    """The launcher uses the image built by GitHub Actions, not a local one."""
+    assert imu.IMAGE == 'ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy'
+
+
+def test_pull_image_runs_docker_pull(docker, capsys):
+    """Download the prebuilt image with a long timeout; never build locally."""
+    launcher = make_launcher()
+    launcher.pull_image()
+    args, kwargs = [c for c in docker.calls if c[0][1] == 'pull'][0]
+    assert args == ['docker', 'pull', imu.IMAGE]
+    assert kwargs['timeout'] >= 3600
     assert 'build' not in docker.subcommands()
 
 
-def test_build_image_runs_docker_build(docker, tmp_path):
-    """Build with the repository as context and a long timeout."""
-    (tmp_path / 'docker').mkdir()
-    (tmp_path / 'docker' / 'Dockerfile').write_text('FROM scratch\n')
-    launcher = make_launcher(tmp_path=tmp_path)
-    launcher.build_image()
-    args, kwargs = [c for c in docker.calls if c[0][1] == 'build'][0]
-    assert args == ['docker', 'build', '-t', 'yahboom-imu:jazzy', '-f',
-                    str(tmp_path / 'docker' / 'Dockerfile'), str(tmp_path)]
-    assert kwargs['timeout'] >= 3600
+def test_pull_image_failure_is_reported(docker):
+    """A failed pull raises a clear error naming the image."""
+    docker.pull_rc = 1
+    launcher = make_launcher()
+    with pytest.raises(imu.LauncherError) as excinfo:
+        launcher.pull_image()
+    assert imu.IMAGE in str(excinfo.value)
+
+
+def test_pull_image_requires_docker_daemon(docker):
+    """Do not try to pull when the docker daemon is down."""
+    docker.daemon_ok = False
+    with pytest.raises(imu.LauncherError):
+        make_launcher().pull_image()
+    assert 'pull' not in docker.subcommands()
 
 
 def test_stop_container_when_not_running(docker, capsys):

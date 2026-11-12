@@ -37,12 +37,12 @@
 把 IMU 綁定進 WSL,接著所有人以 [usb_udev_namer](https://github.com/alianlbj23/usb_udev_namer) 把 IMU 命名為 `usb_imu`。
 後續實作都使用 `/dev/usb_imu`。
 
-授課者請另讀 [instructor-notes.md](instructor-notes.md):器材清單、課前必做(Docker 映像要在課前建好)、每段的常見卡關點。
+授課者請另讀 [instructor-notes.md](instructor-notes.md):器材清單、課前必做(Docker 映像要在課前下載好)、每段的常見卡關點。
 
 ## 每組器材
 
 - CMP10A IMU 模組 1 個、USB 線 1 條
-- 筆電 1 台:Linux、Windows 11 (WSL2) 或 macOS,**課前已建好 Docker 映像**(見 [instructor-notes.md](instructor-notes.md))
+- 筆電 1 台:Linux、Windows 11 (WSL2) 或 macOS,**課前已下載 Docker 映像**(見 [instructor-notes.md](instructor-notes.md))
 - 水平儀(手機 app 即可)、一個方形盒子或書本(用來量 90°)
 - 一塊小鐵片或鐵盒(干擾實驗用)、尺
 

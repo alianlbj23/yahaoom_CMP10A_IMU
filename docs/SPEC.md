@@ -117,14 +117,14 @@ args:`port`, `baud`, `rviz`(false), `rosbridge`(true), `foxglove`(true), `calibr
 rosbridge_websocket port 9090、foxglove_bridge port 8765,皆 address 0.0.0.0(容器內;主機端由 `-p` 控制綁定)。
 
 ### Docker
-- 映像名 `yahboom-imu:jazzy`;套件:ros-jazzy-rviz2、ros-jazzy-rviz-imu-plugin、ros-jazzy-rosbridge-suite、
+- 映像名 `ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy`(由 GitHub Actions 建置並發佈,amd64 + arm64;`imu.py` 只下載、不在本機建置);套件:ros-jazzy-rviz2、ros-jazzy-rviz-imu-plugin、ros-jazzy-rosbridge-suite、
   ros-jazzy-foxglove-bridge、ros-jazzy-tf2-ros、python3-serial、python3-yaml、python3-numpy
 - 容器內 colcon build `wit_ros2_imu`;entrypoint source `/opt/ros/jazzy` 與 workspace
 - `LIBGL_ALWAYS_SOFTWARE=1`(WSLg / XQuartz 相容)
 
 ### `imu.py`(主機端選單,stdlib only)
 平台偵測:linux / wsl(`/proc/version` 含 microsoft)/ mac(`sys.platform == 'darwin'`)。
-選單:1 建置映像 2 啟動 IMU + Foxglove bridges 3 啟動 IMU + RViz2(+ bridges)4 IMU 校正工具
+選單:1 下載映像(docker pull)2 啟動 IMU + Foxglove bridges 3 啟動 IMU + RViz2(+ bridges)4 IMU 校正工具
 5 進入容器 shell 6 停止容器 7 環境檢查 0 離開。
 - 序列埠:linux/wsl 列出 `/dev/serial/by-id/*`、`/dev/ttyUSB*`、`/dev/ttyACM*` 讓使用者選,`--device` 傳入容器並以
   容器內 `/dev/ttyUSB0`…原路徑使用;有 `/dev/usb_imu`(usb_udev_namer 建立)時排第一,並以該名稱傳入容器;

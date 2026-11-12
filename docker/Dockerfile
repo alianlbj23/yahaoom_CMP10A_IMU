@@ -1,6 +1,7 @@
 # Yahboom CMP10A IMU - ROS 2 Jazzy image (driver + RViz2 + rosbridge + foxglove_bridge)
-# Build from the repository root:
-#   docker build -t yahboom-imu:jazzy -f docker/Dockerfile .
+# Built and published by .github/workflows/docker-image.yml as
+#   ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy
+# Users pull that image through `python3 imu.py`; it is not built locally.
 FROM ros:jazzy-ros-base
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
