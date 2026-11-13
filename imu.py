@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import glob
 import importlib
+import json
 import os
 import platform as platform_mod
+import re
 import socket
 import subprocess
 import sys
@@ -75,6 +77,12 @@ MAC_PORT_GLOBS = ('/dev/cu.usbserial*', '/dev/cu.SLAB*',
 
 PYSERIAL_HINT = 'python3 -m pip install pyserial==3.5'
 
+SETTINGS_FILE = 'launcher.json'
+NETWORK_MODES = ('bridge', 'host')
+MAX_DOMAIN_ID = 232           # highest ROS_DOMAIN_ID usable on every platform
+TOPIC_RE = re.compile(r'^/?[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)*$')
+FRAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
 MENU = (
     ('1', '下載 Docker 映像 (%s)' % IMAGE),
     ('2', '啟動 IMU + Foxglove bridges (rosbridge 9090 / foxglove 8765)'),
@@ -83,12 +91,23 @@ MENU = (
     ('5', '進入容器 shell'),
     ('6', '停止容器'),
     ('7', '環境檢查'),
+    ('8', '設定 (topic 名稱 / frame 名稱 / 網路 / ROS_DOMAIN_ID)'),
     ('0', '離開'),
 )
 
 
 class LauncherError(Exception):
     """A user-facing error; the message explains how to fix it."""
+
+
+class Settings(NamedTuple):
+    """User-editable settings, saved in config/launcher.json."""
+
+    imu_topic: str = '/imu/data'
+    frame_id: str = 'imu_link'
+    publish_tf: bool = False      # world -> frame_id; off: IMU frame only
+    network: str = 'bridge'       # 'bridge' (ports on localhost) or 'host'
+    domain_id: int = 0
 
 
 class SerialPort(NamedTuple):
@@ -208,14 +227,115 @@ def no_port_message(platform: str) -> str:
             % (PREFERRED_PORT, PREFERRED_PORT, NAMER_URL))
 
 
+# ---------------------------------------------------------------- settings
+def validate_topic(text: str) -> str:
+    """Return ``text`` if it is a valid ROS topic name, else raise."""
+    if not isinstance(text, str) or not TOPIC_RE.match(text):
+        raise LauncherError(
+            'topic 名稱 %r 不合法:只能用英文、數字、底線,以 / 分段,'
+            '每段不能以數字開頭,例如 /imu/data。' % (text,))
+    return text
+
+
+def validate_frame(text: str) -> str:
+    """Return ``text`` if it is a valid TF frame name, else raise."""
+    if not isinstance(text, str) or not FRAME_RE.match(text):
+        raise LauncherError(
+            'frame 名稱 %r 不合法:只能用英文、數字、底線,不能以數字開頭,'
+            '不含 /,例如 imu_link。' % (text,))
+    return text
+
+
+def validate_network(text: str) -> str:
+    """Return ``text`` if it is a supported docker network mode."""
+    if text not in NETWORK_MODES:
+        raise LauncherError('網路模式 %r 不合法,只能是 %s。'
+                            % (text, ' 或 '.join(NETWORK_MODES)))
+    return text
+
+
+def validate_domain_id(value) -> int:
+    """Return the ROS_DOMAIN_ID as int (0..MAX_DOMAIN_ID), else raise."""
+    if isinstance(value, bool):
+        number = None
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        number = int(value.strip())
+    else:
+        number = None
+    if number is None or not 0 <= number <= MAX_DOMAIN_ID:
+        raise LauncherError('ROS_DOMAIN_ID %r 不合法,必須是 0 到 %d 的整數。'
+                            % (value, MAX_DOMAIN_ID))
+    return number
+
+
+def validated_settings(data) -> Settings:
+    """Build a Settings from a mapping, validating every field."""
+    if not isinstance(data, dict):
+        raise LauncherError('內容必須是 JSON 物件')
+    defaults = Settings()
+    publish_tf = data.get('publish_tf', defaults.publish_tf)
+    if not isinstance(publish_tf, bool):
+        raise LauncherError('publish_tf 必須是 true 或 false')
+    return Settings(
+        imu_topic=validate_topic(data.get('imu_topic', defaults.imu_topic)),
+        frame_id=validate_frame(data.get('frame_id', defaults.frame_id)),
+        publish_tf=publish_tf,
+        network=validate_network(data.get('network', defaults.network)),
+        domain_id=validate_domain_id(data.get('domain_id',
+                                              defaults.domain_id)),
+    )
+
+
+def load_settings(path: str) -> Settings:
+    """Load settings; a missing file gives the defaults, a bad one raises."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return Settings()
+    except (OSError, ValueError) as exc:
+        raise LauncherError('設定檔 %s 無法讀取: %s\n'
+                            '請修正或刪除該檔 (刪除後使用預設值)。'
+                            % (path, exc))
+    try:
+        return validated_settings(data)
+    except LauncherError as exc:
+        raise LauncherError('設定檔 %s 內容不合法: %s\n'
+                            '請修正或刪除該檔 (刪除後使用預設值)。'
+                            % (path, exc))
+
+
+def save_settings(path: str, settings: Settings) -> None:
+    """Validate and write the settings as JSON (atomic replace)."""
+    data = validated_settings(dict(settings._asdict()))._asdict()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(dict(data), handle, ensure_ascii=False, indent=2)
+            handle.write('\n')
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise LauncherError('無法寫入設定檔 %s: %s' % (path, exc))
+
+
+def settings_path(repo_dir: str) -> str:
+    """Return the path of the launcher settings file."""
+    return os.path.join(repo_dir, 'config', SETTINGS_FILE)
+
+
 # ---------------------------------------------------------- docker run args
 def container_port(platform: str, device: str) -> str:
     """Return the serial port name the driver uses inside the container."""
     return MAC_SERIAL_URL if platform == 'mac' else device
 
 
-def container_command(mode: str, port: Optional[str]) -> List[str]:
+def container_command(mode: str, port: Optional[str],
+                      settings: Optional[Settings] = None) -> List[str]:
     """Return the command executed inside the container."""
+    settings = settings or Settings()
     if mode == 'shell':
         return ['bash']
     if not port:
@@ -223,7 +343,11 @@ def container_command(mode: str, port: Optional[str]) -> List[str]:
     if mode in ('foxglove', 'rviz'):
         return ['ros2', 'launch', 'wit_ros2_imu', 'imu.launch.py',
                 'port:=%s' % port,
-                'rviz:=%s' % ('true' if mode == 'rviz' else 'false')]
+                'rviz:=%s' % ('true' if mode == 'rviz' else 'false'),
+                'imu_topic:=%s' % settings.imu_topic,
+                'frame_id:=%s' % settings.frame_id,
+                'publish_tf:=%s' % ('true' if settings.publish_tf
+                                    else 'false')]
     if mode == 'calibrate':
         return ['ros2', 'run', 'wit_ros2_imu', 'imu_calibrate',
                 '--port', port, '--baud', str(BAUD),
@@ -269,7 +393,8 @@ def gui_args(platform: str, env: Mapping[str, str]) -> List[str]:
 def build_run_args(platform: str, port: Optional[str], mode: str,
                    expose_lan: bool, repo_dir: str,
                    env: Mapping[str, str],
-                   realpath_func: Optional[Callable[[str], str]] = None
+                   realpath_func: Optional[Callable[[str], str]] = None,
+                   settings: Optional[Settings] = None
                    ) -> List[str]:
     """Return the full ``docker run`` argument list.
 
@@ -287,9 +412,15 @@ def build_run_args(platform: str, port: Optional[str], mode: str,
     if not port and mode != 'shell':
         raise LauncherError('模式 %s 需要序列埠' % mode)
 
+    settings = settings or Settings()
     args = ['docker', 'run', '--rm', '-it', '--name', CONTAINER_NAME]
-    if mode in PUBLISH_MODES:
+    if settings.network == 'host':
+        # Share the host network (and IPC, which DDS shared memory needs) so
+        # other containers and host processes can see the topics directly.
+        args += ['--network', 'host', '--ipc', 'host']
+    elif mode in PUBLISH_MODES:
         args += publish_args(expose_lan)
+    args += ['-e', 'ROS_DOMAIN_ID=%d' % settings.domain_id]
     args += ['-v', '%s:%s' % (os.path.join(repo_dir, 'config'),
                               CONTAINER_CONFIG)]
     args += ['-v', '%s:%s:ro' % (os.path.join(repo_dir, SOURCE_DIR),
@@ -303,7 +434,7 @@ def build_run_args(platform: str, port: Optional[str], mode: str,
     if mode in GUI_MODES:
         args += gui_args(platform, env)
     args.append(IMAGE)
-    args += container_command(mode, inner_port)
+    args += container_command(mode, inner_port, settings)
     return args
 
 
@@ -382,8 +513,11 @@ def tcp_port_free(port: int) -> bool:
     return True
 
 
-def connection_info(mode: str, expose_lan: bool) -> str:
+def connection_info(mode: str, expose_lan: bool,
+                    settings: Optional[Settings] = None) -> str:
     """Return the Foxglove / RViz connection instructions."""
+    settings = settings or Settings()
+    topic = settings.imu_topic
     lines = [
         '',
         '=== 連線資訊 ===',
@@ -391,11 +525,22 @@ def connection_info(mode: str, expose_lan: bool) -> str:
         '  • Foxglove WebSocket: ws://localhost:%d  (建議)' % FOXGLOVE_PORT,
         '  • Rosbridge:          ws://localhost:%d' % ROSBRIDGE_PORT,
         '建議面板:',
-        '  • 3D:看 TF world → imu_link 的姿態 (Fixed frame = world)',
-        '  • Plot:/imu/data.linear_acceleration.x/.y/.z、'
-        '/imu/data.angular_velocity.z',
-        '  • Raw Messages:/imu/data、/imu/mag、/imu/temperature',
+        '  • Plot:%s.linear_acceleration.x/.y/.z、%s.angular_velocity.z'
+        % (topic, topic),
+        '  • Raw Messages:%s、/imu/mag、/imu/temperature' % topic,
+        '設定:topic %s、frame %s、網路 %s、ROS_DOMAIN_ID %d'
+        % (topic, settings.frame_id, settings.network, settings.domain_id),
     ]
+    if settings.publish_tf:
+        lines.append('  • 3D:看 TF world → %s 的姿態 (Fixed frame = world)'
+                     % settings.frame_id)
+    else:
+        lines.append('目前不發佈 world → %s 的 TF (3D 面板不會轉動);'
+                     '要看 3D 姿態請在「設定」開啟。' % settings.frame_id)
+    if settings.network == 'host':
+        lines.append('host 網路:埠 %d / %d 直接開在主機所有網路介面,'
+                     '沒有認證,只在信任的網路使用。'
+                     % (FOXGLOVE_PORT, ROSBRIDGE_PORT))
     if expose_lan:
         lines.append('已開放區網:其他電腦請改用 ws://<本機 IP>:%d / :%d'
                      % (FOXGLOVE_PORT, ROSBRIDGE_PORT))
@@ -462,6 +607,7 @@ class Launcher:
             5: lambda: self.start('shell'),
             6: self.stop_container,
             7: self.check_environment,
+            8: self.settings_menu,
         }
         failed = False
         try:
@@ -497,6 +643,61 @@ class Launcher:
                 % (IMAGE, result.returncode))
         print('映像 %s 下載完成。' % IMAGE)
 
+    def settings_menu(self) -> None:
+        """Show and edit topic, frame, world TF, network and domain id."""
+        path = settings_path(self.repo_dir)
+        settings = load_settings(path)
+        while True:
+            print('\n=== 設定 (存於 %s) ===' % path)
+            print('  1) IMU topic 名稱: %s' % settings.imu_topic)
+            print('  2) frame 名稱: %s' % settings.frame_id)
+            print('  3) 發佈 world → %s 的 TF: %s'
+                  % (settings.frame_id, '是' if settings.publish_tf else '否'))
+            print('  4) 網路模式: %s' % settings.network)
+            print('  5) ROS_DOMAIN_ID: %d' % settings.domain_id)
+            print('  6) 恢復預設值')
+            print('  0) 返回')
+            choice = self.ask_choice('請選擇', 0, 6)
+            if choice == 0:
+                return
+            try:
+                new = self._edit_setting(choice, settings)
+            except LauncherError as exc:
+                print('[錯誤] %s\n未變更。' % exc)
+                continue
+            if new != settings:
+                save_settings(path, new)
+                settings = new
+                print('已儲存。下次啟動 IMU 時生效。')
+
+    def _edit_setting(self, choice: int, settings: Settings) -> Settings:
+        if choice == 1:
+            text = self.input_func('新的 IMU topic 名稱 (例如 /imu/data): ')
+            return settings._replace(imu_topic=validate_topic(text.strip()))
+        if choice == 2:
+            text = self.input_func('新的 frame 名稱 (例如 imu_link): ')
+            return settings._replace(frame_id=validate_frame(text.strip()))
+        if choice == 3:
+            return settings._replace(publish_tf=not settings.publish_tf)
+        if choice == 4:
+            other = 'host' if settings.network == 'bridge' else 'bridge'
+            if other == 'host':
+                print('host:容器直接使用主機網路,其他容器與主機上的 ROS 2 '
+                      '節點看得到 topic;埠 %d / %d 會開在所有網路介面。'
+                      % (ROSBRIDGE_PORT, FOXGLOVE_PORT))
+            else:
+                print('bridge:容器網路獨立,只把 %d / %d 開給 Foxglove,'
+                      '其他容器看不到 topic。'
+                      % (ROSBRIDGE_PORT, FOXGLOVE_PORT))
+            return settings._replace(network=other)
+        if choice == 5:
+            text = self.input_func('新的 ROS_DOMAIN_ID (0-%d): '
+                                   % MAX_DOMAIN_ID)
+            return settings._replace(domain_id=validate_domain_id(text))
+        if self.ask_yes_no('確定恢復所有設定的預設值嗎?'):
+            return Settings()
+        return settings
+
     def stop_container(self) -> None:
         """Stop the running container, if any."""
         if not container_running():
@@ -521,8 +722,9 @@ class Launcher:
             self._check_port(port)
         if mode in GUI_MODES and not self._check_display(mode):
             return False
+        settings = load_settings(settings_path(self.repo_dir))
         expose_lan = False
-        if mode in PUBLISH_MODES:
+        if mode in PUBLISH_MODES and settings.network != 'host':
             expose_lan = self.ask_yes_no(
                 '是否開放區網存取 (埠綁 0.0.0.0;rosbridge 沒有認證)?')
         if container_running():
@@ -535,13 +737,13 @@ class Launcher:
         config_dir = os.path.join(self.repo_dir, 'config')
         os.makedirs(config_dir, exist_ok=True)
         args = build_run_args(self.platform, port, mode, expose_lan,
-                              self.repo_dir, self.env)
+                              self.repo_dir, self.env, settings=settings)
         bridge = None
         if self.platform == 'mac' and port is not None:
             bridge = self._start_bridge(port)
         try:
             if mode in ('foxglove', 'rviz'):
-                print(connection_info(mode, expose_lan))
+                print(connection_info(mode, expose_lan, settings))
             print('\n執行: %s\n' % ' '.join(args))
             self._run_foreground(args)
         finally:

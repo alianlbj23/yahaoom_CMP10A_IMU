@@ -41,6 +41,13 @@ def generate_launch_description():
                               description=f'Start rosbridge_websocket on port {ROSBRIDGE_PORT}'),
         DeclareLaunchArgument('foxglove', default_value='true',
                               description=f'Start foxglove_bridge on port {FOXGLOVE_PORT}'),
+        DeclareLaunchArgument('imu_topic', default_value='imu/data',
+                              description='Topic name of the sensor_msgs/Imu output'),
+        DeclareLaunchArgument('frame_id', default_value='imu_link',
+                              description='frame_id written into every message'),
+        DeclareLaunchArgument('publish_tf', default_value='false',
+                              description='Publish the world -> frame_id transform '
+                                          '(for viewing the attitude in 3D)'),
         DeclareLaunchArgument('calibration_file',
                               default_value='/config/imu_calibration.yaml',
                               description='Software calibration YAML (missing file = none)'),
@@ -56,7 +63,11 @@ def generate_launch_description():
             'baud': ParameterValue(LaunchConfiguration('baud'), value_type=int),
             'calibration_file': ParameterValue(LaunchConfiguration('calibration_file'),
                                                value_type=str),
+            'frame_id': ParameterValue(LaunchConfiguration('frame_id'), value_type=str),
+            'publish_tf': ParameterValue(LaunchConfiguration('publish_tf'),
+                                         value_type=bool),
         }],
+        remappings=[('imu/data', LaunchConfiguration('imu_topic'))],
     )
 
     rviz_node = Node(

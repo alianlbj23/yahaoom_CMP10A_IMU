@@ -106,8 +106,9 @@ python3 imu.py
   5) 進入容器 shell
   6) 停止容器
   7) 環境檢查
+  8) 設定 (topic 名稱 / frame 名稱 / 網路 / ROS_DOMAIN_ID)
   0) 離開
-請選擇 [0-7]:
+請選擇 [0-8]:
 ```
 
 | 選項 | 做什麼 |
@@ -118,6 +119,7 @@ python3 imu.py
 | 4 校正工具 | `ros2 run wit_ros2_imu imu_calibrate --port <埠> --baud 9600 --config /config/imu_calibration.yaml`(見[校正流程](#校正流程)) |
 | 5 容器 shell | `bash`,ROS 環境已 source;有序列埠時一併傳入 |
 | 6 停止容器 | `docker stop yahboom-imu` |
+| 8 設定 | 修改 IMU topic 名稱、frame 名稱、是否發佈 `world → frame` 的 TF、網路模式(bridge / host)、ROS_DOMAIN_ID;存於 `config/launcher.json` |
 | 7 環境檢查 | 平台、docker daemon、映像是否已下載、容器狀態、序列埠與權限、DISPLAY |
 
 建議第一次使用:**7 環境檢查 → 1 下載映像 → 2 啟動 Foxglove**。
@@ -147,6 +149,23 @@ python3 imu.py
 
 ---
 
+## 設定(選項 8)
+
+這個 repo 只負責打開 IMU。預設只送出 IMU 資料,frame 為 `imu_link`,**不發佈任何 TF**,不會干擾機器人其他部分的座標系。
+
+| 項目 | 預設 | 說明 |
+|---|---|---|
+| IMU topic 名稱 | `/imu/data` | `sensor_msgs/Imu` 的 topic。`/imu/mag`、`/imu/temperature`、`/imu/pressure` 不受影響 |
+| frame 名稱 | `imu_link` | 寫入每筆訊息的 `header.frame_id` |
+| 發佈 `world → frame` 的 TF | 否 | 只在桌上用 3D 面板或 RViz2 看姿態時開啟;與機器人的 TF 樹一起使用時必須關閉 |
+| 網路模式 | `bridge` | `bridge`:只把 9090 / 8765 開給 Foxglove。`host`:加上 `--network host --ipc host`,其他容器與主機上的 ROS 2 節點可直接收到 topic |
+| ROS_DOMAIN_ID | `0` | 0–232,須與要互通的節點相同 |
+
+設定存於 `config/launcher.json`(不進版控),每次啟動時讀取;檔案內容不合法時會指出檔案路徑並拒絕啟動。
+
+`host` 模式下不再詢問是否開放區網:埠直接開在主機的所有網路介面,且沒有認證,只在信任的網路使用。
+Docker Desktop 的 host 網路指的是它的虛擬機,不是 Windows 本身;在 WSL 內安裝的 Docker Engine 則沒有這個差別。
+
 ## Foxglove 連線
 
 1. 用選項 **2**(或 3)啟動。
@@ -156,7 +175,7 @@ python3 imu.py
 3. 建議面板:
    | 面板 | 設定 |
    |---|---|
-   | **3D** | Display frame / Fixed frame 設 `world`,看 TF `world → imu_link` 隨 IMU 轉動 |
+   | **3D** | 需先在選項 8 開啟「發佈 world → frame 的 TF」。Display frame / Fixed frame 設 `world`,看 TF `world → imu_link` 隨 IMU 轉動 |
    | **Plot** | `/imu/data.linear_acceleration.x`、`.y`、`.z`(靜置時 z ≈ 9.8 m/s²);`/imu/data.angular_velocity.z` |
    | **Raw Messages** | `/imu/data`、`/imu/mag`、`/imu/temperature` |
    | **Topic Graph / Diagnostics** | 確認 `/imu/data` 約 10 Hz |
@@ -168,6 +187,7 @@ python3 imu.py
 ## RViz2
 
 選項 **3** 會在容器內啟動 RViz2(Fixed Frame = `world`),可看到 TF 與 `rviz_imu_plugin` 的 IMU 姿態。
+要看到姿態,需先在選項 8 開啟「發佈 world → frame 的 TF」(預設關閉)。
 
 - Linux:需要 X11 `DISPLAY`;若出現 `could not connect to display`,執行 `xhost +local:docker` 後重試。
 - WSL2:使用 WSLg,通常不需額外設定;`echo $DISPLAY` 應為 `:0`。
@@ -433,7 +453,7 @@ mag_offset: [x, y, z]    # raw LSB
 | `/imu/mag` | `sensor_msgs/MagneticField` | 磁力計(raw LSB) |
 | `/imu/temperature` | `sensor_msgs/Temperature` | 晶片溫度(°C) |
 | `/imu/pressure` | `sensor_msgs/FluidPressure` | 氣壓(Pa);需先用校正選單 13 開啟氣壓輸出 |
-| TF `world → imu_link` | `tf2_msgs/TFMessage` | IMU 姿態 |
+| TF `world → imu_link` | `tf2_msgs/TFMessage` | IMU 姿態。預設不發佈,在選項 8 開啟 |
 
 在容器 shell(選項 5)內檢查:
 

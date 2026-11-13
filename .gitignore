@@ -6,5 +6,6 @@ install/
 log/
 # Local software-calibration results; keep only *.example.yaml in git
 config/*.yaml
+config/launcher.json
 !config/*.example.yaml
 .env

@@ -237,12 +237,14 @@ def test_build_run_args_linux_foxglove():
     assert args == [
         'docker', 'run', '--rm', '-it', '--name', 'yahboom-imu',
         '-p', '127.0.0.1:9090:9090', '-p', '127.0.0.1:8765:8765',
+        '-e', 'ROS_DOMAIN_ID=0',
         '-v', '/repo/config:/config',
         '-v', '/repo/wit_ros2_imu:/ws/src/wit_ros2_imu:ro',
         '--device', '/dev/ttyUSB0:/dev/ttyUSB0',
         'ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy',
         'ros2', 'launch', 'wit_ros2_imu', 'imu.launch.py',
         'port:=/dev/ttyUSB0', 'rviz:=false',
+        'imu_topic:=/imu/data', 'frame_id:=imu_link', 'publish_tf:=false',
     ]
 
 
@@ -253,14 +255,14 @@ def test_build_run_args_linux_rviz_has_x11():
     assert _has_pair(args, '-e', 'DISPLAY')
     assert _has_pair(args, '-v', '/tmp/.X11-unix:/tmp/.X11-unix')
     assert _has_pair(args, '--device', '/dev/ttyACM1:/dev/ttyACM1')
-    assert args[-2:] == ['port:=/dev/ttyACM1', 'rviz:=true']
+    assert 'port:=/dev/ttyACM1' in args and 'rviz:=true' in args
 
 
 def test_build_run_args_linux_rviz_without_display_has_no_x11():
     """Do not pass X11 options when DISPLAY is not set."""
     args = imu.build_run_args('linux', '/dev/ttyUSB0', 'rviz', False,
                               REPO, {})
-    assert '-e' not in args
+    assert not _has_pair(args, '-e', 'DISPLAY')
     assert '/tmp/.X11-unix:/tmp/.X11-unix' not in args
 
 
@@ -294,8 +296,8 @@ def test_build_run_args_mac_rviz_uses_tcp_bridge_and_xquartz():
     assert '--device' not in args
     assert _has_pair(args, '-e', 'DISPLAY=host.docker.internal:0')
     assert _has_pair(args, '-v', '/Users/me/imu/config:/config')
-    assert args[-2:] == ['port:=socket://host.docker.internal:5760',
-                         'rviz:=true']
+    assert 'port:=socket://host.docker.internal:5760' in args
+    assert 'rviz:=true' in args
 
 
 def test_build_run_args_lan_exposure_drops_loopback_binding():

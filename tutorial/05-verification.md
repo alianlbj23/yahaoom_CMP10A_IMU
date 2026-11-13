@@ -68,6 +68,8 @@ python3 imu.py
 
 選 `2`,開 [Foxglove](https://app.foxglove.dev) 連 `ws://localhost:8765`。
 
+想在 3D 面板看模組轉動:先在 `imu.py` 選 `8`,把「發佈 world → frame 的 TF」打開(預設是關的)。
+
 Plot 面板:X 軸填 `/imu/mag.magnetic_field.x`,Y 軸填 `/imu/mag.magnetic_field.y`,把模組水平轉一圈。
 
 | 畫出來的形狀 | 意思 |

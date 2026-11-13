@@ -35,7 +35,8 @@ def test_launch_arguments_and_defaults():
     description = _load_description()
     args = {a.name: a.default_value for a in description.entities
             if isinstance(a, DeclareLaunchArgument)}
-    assert set(args) == {'port', 'baud', 'rviz', 'rosbridge', 'foxglove', 'calibration_file'}
+    assert set(args) == {'port', 'baud', 'rviz', 'rosbridge', 'foxglove', 'calibration_file',
+                         'imu_topic', 'frame_id', 'publish_tf'}
     context = LaunchContext()
     defaults = {name: ''.join(s.perform(context) for s in value)
                 for name, value in args.items()}
@@ -46,6 +47,9 @@ def test_launch_arguments_and_defaults():
         'rosbridge': 'true',
         'foxglove': 'true',
         'calibration_file': '/config/imu_calibration.yaml',
+        'imu_topic': 'imu/data',
+        'frame_id': 'imu_link',
+        'publish_tf': 'false',       # only the IMU frame unless asked for
     }
     nodes = [e for e in description.entities if isinstance(e, Node)]
     assert len(nodes) == 2  # driver + rviz2 (conditional)

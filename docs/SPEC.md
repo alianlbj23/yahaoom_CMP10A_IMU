@@ -124,7 +124,7 @@ rosbridge_websocket port 9090、foxglove_bridge port 8765,皆 address 0.0.0.0(�
 
 ### `imu.py`(主機端選單,stdlib only)
 平台偵測:linux / wsl(`/proc/version` 含 microsoft)/ mac(`sys.platform == 'darwin'`)。
-選單:1 下載映像(docker pull)2 啟動 IMU + Foxglove bridges 3 啟動 IMU + RViz2(+ bridges)4 IMU 校正工具
+選單(另有 8 設定:IMU topic 名稱、frame 名稱、world TF 開關、網路模式 bridge/host、ROS_DOMAIN_ID,存於 `config/launcher.json`;預設不發佈 TF):1 下載映像(docker pull)2 啟動 IMU + Foxglove bridges 3 啟動 IMU + RViz2(+ bridges)4 IMU 校正工具
 5 進入容器 shell 6 停止容器 7 環境檢查 0 離開。
 - 序列埠:linux/wsl 列出 `/dev/serial/by-id/*`、`/dev/ttyUSB*`、`/dev/ttyACM*` 讓使用者選,`--device` 傳入容器並以
   容器內 `/dev/ttyUSB0`…原路徑使用;有 `/dev/usb_imu`(usb_udev_namer 建立)時排第一,並以該名稱傳入容器;
