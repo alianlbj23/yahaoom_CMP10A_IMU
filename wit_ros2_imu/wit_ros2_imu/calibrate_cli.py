@@ -25,6 +25,7 @@ import dataclasses
 import logging
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -119,6 +120,13 @@ ATTITUDE_HELP = [
     '  3. 對齊桌上的參考線按 Enter,轉一圈再對回:Δyaw 回到 0,誤差 ±3° 內。',
     '  4. 按 Enter 後抬高 1 m:Δ高度 約 +1 m(氣壓計有數十公分雜訊;需先用 13 開啟高度輸出)。',
 ]
+
+# Appended to a menu row once that step has succeeded in this run of the tool.
+# The marks live in memory only: a new run starts with none, so a green row
+# always means "done since this tool was started", never an older calibration.
+DONE_MARK = '✓ 本次已完成'
+_MENU_ROW = re.compile(r'^\s*(\d+)\.')
+
 
 # Guided verification (option 12): tolerances are rules of thumb for this module.
 VERIFY_SAMPLE_TIME = 1.0      # s of fresh data read after each Enter
@@ -217,6 +225,9 @@ class CalibrationMenu:
         self._unlock_time: Optional[float] = None
         self._height_seen = False
         self._verify_lines: List[str] = []
+        self._done: set = set()          # menu choices that succeeded in this run
+        self._step_ok = False            # set by an action when it succeeds
+        self._mag_covered = False
         self._actions = {
             '1': self.live_view,
             '2': self.hw_accel,
@@ -375,6 +386,7 @@ class CalibrationMenu:
             stop.set()
             thread.join(READER_JOIN_TIMEOUT)
             self._end_status()
+        self._mag_covered = bool(cov.samples) and cov.complete() and not errors
         if errors:
             self._out(f'讀取 IMU 資料失敗:{errors[0]}(無法顯示進度,仍會結束校正)')
         elif cov.samples and not cov.complete():
@@ -410,6 +422,8 @@ class CalibrationMenu:
         self._send(wp.cmd_calsw(wp.CalMode.NORMAL))
         self._send(wp.cmd_save())
         self._out('完成,已儲存到 IMU flash。')
+        # A magnetometer calibration only counts when every axis was covered.
+        self._step_ok = self._mag_covered if mag_progress else True
 
     # ------------------------------------------------------------ actions
 
@@ -517,11 +531,13 @@ class CalibrationMenu:
             logger.error('static calibration failed: %s', exc)
             self._out(f'校正失敗:{exc}(請確認序列埠與鮑率)')
             return
-        if math.sqrt(sum(b * b for b in accel_bias)) > LARGE_ACCEL_BIAS:
+        level = math.sqrt(sum(b * b for b in accel_bias)) <= LARGE_ACCEL_BIAS
+        if not level:
             self._out('警告:加速度偏移量偏大,IMU 可能沒有水平放置。')
         cal = dataclasses.replace(self._load_existing(),
                                   gyro_bias=gyro_bias, accel_bias=accel_bias)
         self._save(cal)
+        self._step_ok = level
 
     def sw_mag(self) -> None:
         """Software magnetometer hard-iron calibration written to YAML."""
@@ -561,6 +577,7 @@ class CalibrationMenu:
             return
         cal = dataclasses.replace(self._load_existing(), mag_offset=offset)
         self._save(cal)
+        self._step_ok = cov.complete()
 
     def attitude_view(self) -> None:
         """Verify the calibration step by step, or open the free live view."""
@@ -748,6 +765,8 @@ class CalibrationMenu:
             self._out(self._mark(PASS, '全部合格'))
         elif PASS in statuses:
             self._out('已做的項目都合格;略過的項目尚未驗證。')
+        # Level, the four turns and the full turn must all pass; height is optional.
+        self._step_ok = FAIL not in statuses and statuses.count(PASS) >= 3
 
     def _attitude_free_view(self) -> None:
         """Show live roll / pitch / yaw / height, optionally relative to a reference."""
@@ -852,6 +871,7 @@ class CalibrationMenu:
         self._unlock()
         self._send(wp.cmd_factory_reset())
         self._out('已送出恢復原廠設定指令;建議重新上電,並以預設 9600 baud 連線。')
+        self._done.clear()               # every earlier calibration is gone
 
     # ------------------------------------------------------------ main loop
 
@@ -867,7 +887,7 @@ class CalibrationMenu:
     def run(self) -> int:
         """Run the menu loop and return a process exit code."""
         while True:
-            self._out(MENU)
+            self._out(render_menu(self._done, self._color))
             try:
                 choice = self._ask('請選擇: ')
             except EOFError:
@@ -883,8 +903,11 @@ class CalibrationMenu:
                 self._out(f'無效的選項:{choice!r},請輸入 0-13。')
                 continue
             self._show_notes(choice)
+            self._step_ok = False
             try:
                 action()
+                if self._step_ok:
+                    self._done.add(choice)
             except EOFError:
                 self._out('\n輸入結束,離開。')
                 return 0
@@ -915,6 +938,19 @@ def format_attitude(angles, height: Optional[float], ref=None) -> str:
     dr, dp, dy = (wrap_degrees(a - b) for a, b in ((r, r0), (p, p0), (y, y0)))
     dh = 'Δ高度 (未輸出)' if height is None or h0 is None else f'Δ高度 {height - h0:+7.2f} m'
     return f'Δroll(X) {dr:+7.2f}°  Δpitch(Y) {dp:+7.2f}°  Δyaw(Z) {dy:+7.2f}°  {dh}'
+
+
+def render_menu(done=(), color: bool = False) -> str:
+    """Return the menu with the rows in ``done`` marked (green on a terminal)."""
+    lines = []
+    for line in MENU.split('\n'):
+        match = _MENU_ROW.match(line)
+        if match and match.group(1) in done:
+            line = f'{line}  {DONE_MARK}'
+            if color:
+                line = f'{ANSI_COLOURS[PASS]}{line}{ANSI_RESET}'
+        lines.append(line)
+    return '\n'.join(lines)
 
 
 def mag_coverage_target(mode: wp.CalMode) -> float:

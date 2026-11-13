@@ -1141,3 +1141,88 @@ def test_guided_verification_redraws_the_screen_on_a_terminal(clock, tmp_path):
 def test_guided_verification_does_not_clear_the_screen_without_a_terminal(clock, tmp_path):
     rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
     assert cli.CLEAR_SCREEN not in out.text
+
+
+# ------------------------------------ menu marks steps done in this session
+
+def _menu_blocks(out):
+    """Return every printed menu, in order."""
+    return [ln for ln in out.lines if 'CMP10A IMU 校正工具' in ln]
+
+
+def _menu_row(block, number):
+    """Return the raw menu row for ``number`` (colour codes are ignored when matching)."""
+    green = cli.ANSI_COLOURS[cli.PASS]
+    return next(ln for ln in block.splitlines()
+                if ln.replace(green, '').strip().startswith(f'{number}.'))
+
+
+def test_menu_starts_with_nothing_marked_done(clock, tmp_path):
+    ser = FakeSerial(clock)
+    out = Output()
+    cli.run_menu(ser, scripted(['0']), out, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    first = _menu_blocks(out)[0]
+    assert cli.ANSI_COLOURS[cli.PASS] not in first
+    assert cli.DONE_MARK not in first
+
+
+def test_menu_marks_a_successful_calibration_green_for_this_session(clock, tmp_path):
+    ser = FakeSerial(clock)
+    out = Output()
+    cli.run_menu(ser, scripted(['2', 'y', '0']), out, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    before, after = _menu_blocks(out)[0], _menu_blocks(out)[-1]
+    assert cli.DONE_MARK not in _menu_row(before, 2)
+    row = _menu_row(after, 2)
+    assert row.startswith(cli.ANSI_COLOURS[cli.PASS]) and cli.DONE_MARK in row
+    assert cli.DONE_MARK not in _menu_row(after, 3)          # other steps stay plain
+
+
+def test_menu_does_not_mark_a_cancelled_calibration(clock, tmp_path):
+    ser = FakeSerial(clock)
+    out = Output()
+    cli.run_menu(ser, scripted(['2', 'n', '0']), out, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    assert cli.DONE_MARK not in _menu_blocks(out)[-1]
+
+
+def test_menu_marks_are_not_kept_for_the_next_run(clock, tmp_path):
+    ser = FakeSerial(clock)
+    out = Output()
+    cli.run_menu(ser, scripted(['2', 'y', '0']), out, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    assert cli.DONE_MARK in _menu_blocks(out)[-1]
+    out2 = Output()
+    cli.run_menu(FakeSerial(clock), scripted(['0']), out2, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    assert cli.DONE_MARK not in out2.text
+
+
+def test_factory_reset_clears_the_done_marks(clock, tmp_path):
+    ser = FakeSerial(clock)
+    out = Output()
+    cli.run_menu(ser, scripted(['2', 'y', '11', 'y', 'y', '0']), out, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    assert cli.DONE_MARK not in _menu_blocks(out)[-1]
+
+
+def test_menu_marks_done_without_colour_codes_off_a_terminal(clock, tmp_path):
+    ser = FakeSerial(clock)
+    out = Output()
+    cli.run_menu(ser, scripted(['2', 'y', '0']), out, tmp_path / 'c.yaml',
+                 sleep_fn=clock.sleep, time_fn=clock.time)
+    last = _menu_blocks(out)[-1]
+    assert cli.DONE_MARK in _menu_row(last, 2)
+    assert '\033[' not in last
+
+
+def test_passed_guided_verification_marks_option_12(clock, tmp_path):
+    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN, color=True)
+    assert cli.DONE_MARK in _menu_row(_menu_blocks(out)[-1], 12)
+
+
+def test_failed_guided_verification_does_not_mark_option_12(clock, tmp_path):
+    steps = [(None, '12'), (None, ''), (_level(roll=2.0), ''), (None, 'q'), (None, '0')]
+    rc, out, _ = _guided(clock, tmp_path, steps, color=True)
+    assert cli.DONE_MARK not in _menu_blocks(out)[-1]
