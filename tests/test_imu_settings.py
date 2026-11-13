@@ -298,3 +298,24 @@ def test_start_joins_an_existing_custom_network(docker, tmp_path):
     launcher.start('foxglove')
     args = docker.run_call()[0]
     assert _has_pair(args, '--network', 'compose_my_bridge_network')
+
+
+def test_network_labels_tell_the_default_bridge_from_custom_ones(docker,
+                                                                 tmp_path,
+                                                                 capsys):
+    """
+    "bridge" must not be mistaken for the driver type of a custom network.
+
+    A compose network is also of type bridge, so the built-in one is always
+    labelled as docker's default network, and the prompt asks for a name.
+    """
+    assert imu.network_label('bridge') == 'bridge (Docker 預設網路)'
+    assert imu.network_label('host') == 'host (主機網路)'
+    assert imu.network_label('compose_my_bridge_network') == \
+        'compose_my_bridge_network (自訂的 Docker 網路)'
+    launcher = make_launcher(answers=['4', '', '0'], tmp_path=tmp_path)
+    launcher.settings_menu()
+    out = capsys.readouterr().out
+    assert 'bridge (Docker 預設網路)' in out
+    assert '填的是網路的「名稱」' in out
+    assert 'driver: bridge' in out

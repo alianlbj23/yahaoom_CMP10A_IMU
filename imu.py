@@ -484,6 +484,19 @@ def docker_daemon_status() -> Tuple[bool, str]:
     return False, detail[-1] if detail else 'exit %d' % result.returncode
 
 
+def network_label(name: str) -> str:
+    """Return ``name`` with a note saying which kind of network it is.
+
+    A compose network is usually of driver type "bridge" as well, so the
+    built-in network called ``bridge`` is spelled out as docker's default.
+    """
+    if name == 'bridge':
+        return 'bridge (Docker 預設網路)'
+    if name == 'host':
+        return 'host (主機網路)'
+    return '%s (自訂的 Docker 網路)' % name
+
+
 def network_exists(name: str) -> bool:
     """Return True if the docker network ``name`` exists."""
     return docker(['network', 'inspect', name]).returncode == 0
@@ -506,7 +519,7 @@ def missing_network_message(name: str) -> str:
         '        docker compose up -d',
         '    (compose 建立的網路名稱是「資料夾名稱_網路名稱」)',
         '  • 用 docker network ls 查看現有的網路名稱。',
-        '  • 或在選單 8 把網路改回 bridge / host。',
+        '  • 或在選單 8 把網路改回 bridge (Docker 預設網路) 或 host。',
         '本工具不會自動建立網路。',
     ))
 
@@ -567,7 +580,8 @@ def connection_info(mode: str, expose_lan: bool,
         % (topic, topic),
         '  • Raw Messages:%s、/imu/mag、/imu/temperature' % topic,
         '設定:topic %s、frame %s、網路 %s、ROS_DOMAIN_ID %d'
-        % (topic, settings.frame_id, settings.network, settings.domain_id),
+        % (topic, settings.frame_id, network_label(settings.network),
+           settings.domain_id),
     ]
     if settings.publish_tf:
         lines.append('  • 3D:看 TF world → %s 的姿態 (Fixed frame = world)'
@@ -691,8 +705,7 @@ class Launcher:
             print('  2) frame 名稱: %s' % settings.frame_id)
             print('  3) 發佈 world → %s 的 TF: %s'
                   % (settings.frame_id, '是' if settings.publish_tf else '否'))
-            print('  4) 網路 (bridge / host / 自訂名稱): %s'
-                  % settings.network)
+            print('  4) 網路: %s' % network_label(settings.network))
             print('  5) ROS_DOMAIN_ID: %d' % settings.domain_id)
             print('  6) 恢復預設值')
             print('  0) 返回')
@@ -720,11 +733,15 @@ class Launcher:
             return settings._replace(publish_tf=not settings.publish_tf)
         if choice == 4:
             names = list_networks()
-            print('  bridge:容器網路獨立,只把 %d / %d 開給 Foxglove,'
+            print('這裡填的是網路的「名稱」,不是類型。')
+            print('  bridge:Docker 預設網路。只把 %d / %d 開給 Foxglove,'
                   '其他容器看不到 topic。' % (ROSBRIDGE_PORT, FOXGLOVE_PORT))
-            print('  host:直接使用主機網路,主機與其他 host 容器看得到 topic;'
+            print('  host:主機網路。主機與其他 host 容器看得到 topic;'
                   '埠會開在所有網路介面。')
-            print('  自訂名稱:接上該 Docker 網路,同一個網路上的容器看得到 topic。')
+            print('  其他名稱:自訂的 Docker 網路,同一個網路上的容器看得到 '
+                  'topic。')
+            print('  (compose 檔裡的 driver: bridge 是類型;要填的是它的名稱,'
+                  '通常是「資料夾名稱_網路名稱」)')
             if names:
                 print('  目前電腦上的 Docker 網路:%s' % '、'.join(names))
             text = self.input_func('網路名稱 (直接 Enter 不變更,目前 %s): '

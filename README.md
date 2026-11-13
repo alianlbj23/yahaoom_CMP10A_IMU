@@ -158,10 +158,12 @@ python3 imu.py
 | IMU topic 名稱 | `/imu/data` | `sensor_msgs/Imu` 的 topic。`/imu/mag`、`/imu/temperature`、`/imu/pressure` 不受影響 |
 | frame 名稱 | `imu_link` | 寫入每筆訊息的 `header.frame_id` |
 | 發佈 `world → frame` 的 TF | 否 | 只在桌上用 3D 面板或 RViz2 看姿態時開啟;與機器人的 TF 樹一起使用時必須關閉 |
-| 網路 | `bridge` | 可自行輸入。`bridge`:只把 9090 / 8765 開給 Foxglove。`host`:加上 `--network host --ipc host`,主機與其他 host 容器可直接收到 topic。其他名稱:視為自訂的 Docker 網路,以 `--network <名稱>` 接上,同一網路上的容器可互通(埠仍照 bridge 的方式開放)|
+| 網路 | `bridge` | 填的是網路的**名稱**,可自行輸入。`bridge`:Docker 預設網路,只把 9090 / 8765 開給 Foxglove。`host`:加上 `--network host --ipc host`,主機與其他 host 容器可直接收到 topic。其他名稱:視為自訂的 Docker 網路,以 `--network <名稱>` 接上,同一網路上的容器可互通(埠仍照 bridge 的方式開放)|
 | ROS_DOMAIN_ID | `0` | 0–232,須與要互通的節點相同 |
 
 設定存於 `config/launcher.json`(不進版控),每次啟動時讀取;檔案內容不合法時會指出檔案路徑並拒絕啟動。
+
+compose 檔中的 `driver: bridge` 是網路類型,不是名稱;自訂網路的類型通常也是 bridge,但與 Docker 預設那個名為 `bridge` 的網路互不相通。選單與連線資訊會標明目前是「Docker 預設網路」「主機網路」或「自訂的 Docker 網路」。
 
 自訂網路必須已經存在(例如由 docker compose 建立,名稱為「資料夾名稱_網路名稱」);不存在時啟動會中止並說明處理方式,本工具不會自動建立。設定選單會列出電腦上現有的 Docker 網路供參考。
 
