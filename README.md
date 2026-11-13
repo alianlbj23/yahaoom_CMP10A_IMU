@@ -119,7 +119,7 @@ python3 imu.py
 | 4 校正工具 | `ros2 run wit_ros2_imu imu_calibrate --port <埠> --baud 9600 --config /config/imu_calibration.yaml`(見[校正流程](#校正流程)) |
 | 5 容器 shell | `bash`,ROS 環境已 source;有序列埠時一併傳入 |
 | 6 停止容器 | `docker stop yahboom-imu` |
-| 8 設定 | 修改 IMU topic 名稱、frame 名稱、是否發佈 `world → frame` 的 TF、網路模式(bridge / host)、ROS_DOMAIN_ID;存於 `config/launcher.json` |
+| 8 設定 | 修改 IMU topic 名稱、frame 名稱、是否發佈 `world → frame` 的 TF、網路(bridge / host / 自訂 Docker 網路名稱)、ROS_DOMAIN_ID;存於 `config/launcher.json` |
 | 7 環境檢查 | 平台、docker daemon、映像是否已下載、容器狀態、序列埠與權限、DISPLAY |
 
 建議第一次使用:**7 環境檢查 → 1 下載映像 → 2 啟動 Foxglove**。
@@ -158,10 +158,12 @@ python3 imu.py
 | IMU topic 名稱 | `/imu/data` | `sensor_msgs/Imu` 的 topic。`/imu/mag`、`/imu/temperature`、`/imu/pressure` 不受影響 |
 | frame 名稱 | `imu_link` | 寫入每筆訊息的 `header.frame_id` |
 | 發佈 `world → frame` 的 TF | 否 | 只在桌上用 3D 面板或 RViz2 看姿態時開啟;與機器人的 TF 樹一起使用時必須關閉 |
-| 網路模式 | `bridge` | `bridge`:只把 9090 / 8765 開給 Foxglove。`host`:加上 `--network host --ipc host`,其他容器與主機上的 ROS 2 節點可直接收到 topic |
+| 網路 | `bridge` | 可自行輸入。`bridge`:只把 9090 / 8765 開給 Foxglove。`host`:加上 `--network host --ipc host`,主機與其他 host 容器可直接收到 topic。其他名稱:視為自訂的 Docker 網路,以 `--network <名稱>` 接上,同一網路上的容器可互通(埠仍照 bridge 的方式開放)|
 | ROS_DOMAIN_ID | `0` | 0–232,須與要互通的節點相同 |
 
 設定存於 `config/launcher.json`(不進版控),每次啟動時讀取;檔案內容不合法時會指出檔案路徑並拒絕啟動。
+
+自訂網路必須已經存在(例如由 docker compose 建立,名稱為「資料夾名稱_網路名稱」);不存在時啟動會中止並說明處理方式,本工具不會自動建立。設定選單會列出電腦上現有的 Docker 網路供參考。
 
 `host` 模式下不再詢問是否開放區網:埠直接開在主機的所有網路介面,且沒有認證,只在信任的網路使用。
 Docker Desktop 的 host 網路指的是它的虛擬機,不是 Windows 本身;在 WSL 內安裝的 Docker Engine 則沒有這個差別。

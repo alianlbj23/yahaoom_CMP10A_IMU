@@ -78,7 +78,11 @@ MAC_PORT_GLOBS = ('/dev/cu.usbserial*', '/dev/cu.SLAB*',
 PYSERIAL_HINT = 'python3 -m pip install pyserial==3.5'
 
 SETTINGS_FILE = 'launcher.json'
-NETWORK_MODES = ('bridge', 'host')
+# 'bridge' is docker's default network, 'host' shares the host stack; any other
+# value is the name of a user-defined docker network (e.g. one created by
+# docker compose), typed in by the user.
+BUILTIN_NETWORKS = ('bridge', 'host')
+NETWORK_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 MAX_DOMAIN_ID = 232           # highest ROS_DOMAIN_ID usable on every platform
 TOPIC_RE = re.compile(r'^/?[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)*$')
 FRAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -247,10 +251,13 @@ def validate_frame(text: str) -> str:
 
 
 def validate_network(text: str) -> str:
-    """Return ``text`` if it is a supported docker network mode."""
-    if text not in NETWORK_MODES:
-        raise LauncherError('網路模式 %r 不合法,只能是 %s。'
-                            % (text, ' 或 '.join(NETWORK_MODES)))
+    """Return ``text`` if it is bridge, host or a valid docker network name."""
+    if (not isinstance(text, str) or not NETWORK_RE.match(text)
+            or text == 'none'):
+        raise LauncherError(
+            '網路名稱 %r 不合法:可填 bridge、host,或自訂的 Docker 網路名稱 '
+            '(英文、數字、底線、減號、句點,不能以符號開頭;不支援 none)。'
+            % (text,))
     return text
 
 
@@ -418,8 +425,12 @@ def build_run_args(platform: str, port: Optional[str], mode: str,
         # Share the host network (and IPC, which DDS shared memory needs) so
         # other containers and host processes can see the topics directly.
         args += ['--network', 'host', '--ipc', 'host']
-    elif mode in PUBLISH_MODES:
-        args += publish_args(expose_lan)
+    else:
+        if settings.network != 'bridge':
+            # User-defined network: containers attached to it see each other.
+            args += ['--network', settings.network]
+        if mode in PUBLISH_MODES:
+            args += publish_args(expose_lan)
     args += ['-e', 'ROS_DOMAIN_ID=%d' % settings.domain_id]
     args += ['-v', '%s:%s' % (os.path.join(repo_dir, 'config'),
                               CONTAINER_CONFIG)]
@@ -471,6 +482,33 @@ def docker_daemon_status() -> Tuple[bool, str]:
         return True, 'server %s' % result.stdout.strip()
     detail = (result.stderr or result.stdout or '').strip().splitlines()
     return False, detail[-1] if detail else 'exit %d' % result.returncode
+
+
+def network_exists(name: str) -> bool:
+    """Return True if the docker network ``name`` exists."""
+    return docker(['network', 'inspect', name]).returncode == 0
+
+
+def list_networks() -> List[str]:
+    """Return the names of the existing docker networks (empty on failure)."""
+    result = docker(['network', 'ls', '--format', '{{.Name}}'])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or '').splitlines()
+            if line.strip() and line.strip() != 'none']
+
+
+def missing_network_message(name: str) -> str:
+    """Explain how to make a user-defined network exist."""
+    return '\n'.join((
+        'Docker 網路 %s 不存在,無法啟動。' % name,
+        '  • 這個網路若由 docker compose 管理,請先啟動那份 compose:',
+        '        docker compose up -d',
+        '    (compose 建立的網路名稱是「資料夾名稱_網路名稱」)',
+        '  • 用 docker network ls 查看現有的網路名稱。',
+        '  • 或在選單 8 把網路改回 bridge / host。',
+        '本工具不會自動建立網路。',
+    ))
 
 
 def image_exists() -> bool:
@@ -653,7 +691,8 @@ class Launcher:
             print('  2) frame 名稱: %s' % settings.frame_id)
             print('  3) 發佈 world → %s 的 TF: %s'
                   % (settings.frame_id, '是' if settings.publish_tf else '否'))
-            print('  4) 網路模式: %s' % settings.network)
+            print('  4) 網路 (bridge / host / 自訂名稱): %s'
+                  % settings.network)
             print('  5) ROS_DOMAIN_ID: %d' % settings.domain_id)
             print('  6) 恢復預設值')
             print('  0) 返回')
@@ -680,16 +719,23 @@ class Launcher:
         if choice == 3:
             return settings._replace(publish_tf=not settings.publish_tf)
         if choice == 4:
-            other = 'host' if settings.network == 'bridge' else 'bridge'
-            if other == 'host':
-                print('host:容器直接使用主機網路,其他容器與主機上的 ROS 2 '
-                      '節點看得到 topic;埠 %d / %d 會開在所有網路介面。'
-                      % (ROSBRIDGE_PORT, FOXGLOVE_PORT))
-            else:
-                print('bridge:容器網路獨立,只把 %d / %d 開給 Foxglove,'
-                      '其他容器看不到 topic。'
-                      % (ROSBRIDGE_PORT, FOXGLOVE_PORT))
-            return settings._replace(network=other)
+            names = list_networks()
+            print('  bridge:容器網路獨立,只把 %d / %d 開給 Foxglove,'
+                  '其他容器看不到 topic。' % (ROSBRIDGE_PORT, FOXGLOVE_PORT))
+            print('  host:直接使用主機網路,主機與其他 host 容器看得到 topic;'
+                  '埠會開在所有網路介面。')
+            print('  自訂名稱:接上該 Docker 網路,同一個網路上的容器看得到 topic。')
+            if names:
+                print('  目前電腦上的 Docker 網路:%s' % '、'.join(names))
+            text = self.input_func('網路名稱 (直接 Enter 不變更,目前 %s): '
+                                   % settings.network).strip()
+            if not text:
+                return settings
+            name = validate_network(text)
+            if name not in BUILTIN_NETWORKS and name not in names:
+                print('[注意] 網路 %s 目前尚未存在;啟動 IMU 前要先讓它存在 '
+                      '(例如先啟動建立它的 docker compose)。' % name)
+            return settings._replace(network=name)
         if choice == 5:
             text = self.input_func('新的 ROS_DOMAIN_ID (0-%d): '
                                    % MAX_DOMAIN_ID)
@@ -723,6 +769,9 @@ class Launcher:
         if mode in GUI_MODES and not self._check_display(mode):
             return False
         settings = load_settings(settings_path(self.repo_dir))
+        if (settings.network not in BUILTIN_NETWORKS
+                and not network_exists(settings.network)):
+            raise LauncherError(missing_network_message(settings.network))
         expose_lan = False
         if mode in PUBLISH_MODES and settings.network != 'host':
             expose_lan = self.ask_yes_no(

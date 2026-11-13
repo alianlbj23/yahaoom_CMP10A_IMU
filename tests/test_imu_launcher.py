@@ -50,6 +50,7 @@ class FakeDocker:
         self.run_rc = run_rc
         self.pull_rc = 0
         self.missing = missing
+        self.networks = ['bridge', 'host', 'none']
 
     def __call__(self, args, **kwargs):
         """Emulate subprocess.run for the docker CLI."""
@@ -76,6 +77,12 @@ class FakeDocker:
             return subprocess.CompletedProcess(args, 0, '', '')
         if sub == 'pull':
             return subprocess.CompletedProcess(args, self.pull_rc)
+        if sub == 'network' and args[2] == 'ls':
+            return subprocess.CompletedProcess(
+                args, 0, ''.join(n + '\n' for n in self.networks), '')
+        if sub == 'network' and args[2] == 'inspect':
+            rc = 0 if args[3] in self.networks else 1
+            return subprocess.CompletedProcess(args, rc, '', '')
         raise AssertionError('unexpected docker call: %r' % (args,))
 
     def subcommands(self):

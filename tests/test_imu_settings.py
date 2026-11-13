@@ -86,12 +86,19 @@ def test_validate_domain_id_rejects_out_of_range(text):
         imu.validate_domain_id(text)
 
 
-def test_validate_network():
-    """Check: validate network."""
-    assert imu.validate_network('host') == 'host'
-    assert imu.validate_network('bridge') == 'bridge'
+@pytest.mark.parametrize('text', ['bridge', 'host', 'ros-net', 'net.1',
+                                  'compose_my_bridge_network'])
+def test_validate_network_accepts_builtin_and_custom_names(text):
+    """Any docker network name can be typed in, not only bridge / host."""
+    assert imu.validate_network(text) == text
+
+
+@pytest.mark.parametrize('text', ['', 'none', 'my net', '-net', 'net;rm -rf',
+                                  'net/1', 'a' * 129])
+def test_validate_network_rejects_bad_names(text):
+    """Reject empty, unusable or unsafe names."""
     with pytest.raises(imu.LauncherError):
-        imu.validate_network('none')
+        imu.validate_network(text)
 
 
 # ---------------------------------------------------------- persistence
@@ -110,7 +117,7 @@ def test_save_then_load_roundtrip(tmp_path):
 
 
 @pytest.mark.parametrize('content', [
-    'not json', '[]', '{"domain_id": 999}', '{"network": "weird"}',
+    'not json', '[]', '{"domain_id": 999}', '{"network": "bad name"}',
     '{"frame_id": "a b"}', '{"imu_topic": 5}', '{"publish_tf": "yes"}',
 ])
 def test_load_settings_rejects_invalid_files(tmp_path, content):
@@ -164,7 +171,7 @@ def test_run_args_host_network_has_no_port_mapping(mode):
 def test_settings_menu_changes_and_saves_every_field(docker, tmp_path,
                                                      capsys):
     """Check: settings menu changes and saves every field."""
-    answers = ['1', '/imu', '2', 'my_imu', '3', '4', '5', '9', '0']
+    answers = ['1', '/imu', '2', 'my_imu', '3', '4', 'host', '5', '9', '0']
     launcher = make_launcher(answers=answers, tmp_path=tmp_path)
     launcher.settings_menu()
     saved = json.loads((tmp_path / 'config' / 'launcher.json').read_text())
@@ -212,3 +219,82 @@ def test_start_uses_the_saved_settings(docker, tmp_path):
 def test_main_menu_offers_the_settings_entry():
     """Check: main menu offers the settings entry."""
     assert any('設定' in text for _, text in imu.MENU)
+
+
+# -------------------------------------------------------- custom networks
+@pytest.mark.parametrize('mode', ['foxglove', 'rviz', 'calibrate', 'shell'])
+def test_run_args_join_a_custom_network(mode):
+    """A custom network is passed to --network and still publishes ports."""
+    s = imu.Settings(network='compose_my_bridge_network', domain_id=1)
+    args = imu.build_run_args('linux', '/dev/ttyUSB0', mode, False, '/repo',
+                              {}, settings=s)
+    assert _has_pair(args, '--network', 'compose_my_bridge_network')
+    assert '--ipc' not in args
+    assert _has_pair(args, '-e', 'ROS_DOMAIN_ID=1')
+    if mode in ('foxglove', 'rviz'):
+        assert _has_pair(args, '-p', '127.0.0.1:8765:8765')
+
+
+def test_run_args_default_bridge_passes_no_network_option():
+    """The default bridge needs no --network option."""
+    args = imu.build_run_args('linux', '/dev/ttyUSB0', 'foxglove', False,
+                              '/repo', {})
+    assert '--network' not in args
+
+
+def test_settings_menu_accepts_a_typed_network_name(docker, tmp_path, capsys):
+    """The network name is typed in; existing networks are listed as a hint."""
+    docker.networks.append('compose_my_bridge_network')
+    launcher = make_launcher(answers=['4', 'compose_my_bridge_network', '0'],
+                             tmp_path=tmp_path)
+    launcher.settings_menu()
+    saved = imu.load_settings(str(tmp_path / 'config' / 'launcher.json'))
+    assert saved.network == 'compose_my_bridge_network'
+    assert 'compose_my_bridge_network' in capsys.readouterr().out
+
+
+def test_settings_menu_allows_a_network_that_does_not_exist_yet(docker,
+                                                                tmp_path,
+                                                                capsys):
+    """A name can be saved before the network exists; a note is shown."""
+    launcher = make_launcher(answers=['4', 'later_net', '0'],
+                             tmp_path=tmp_path)
+    launcher.settings_menu()
+    saved = imu.load_settings(str(tmp_path / 'config' / 'launcher.json'))
+    assert saved.network == 'later_net'
+    assert '尚未存在' in capsys.readouterr().out
+
+
+def test_settings_menu_empty_network_keeps_the_current_value(docker,
+                                                             tmp_path):
+    """Pressing Enter leaves the network unchanged."""
+    launcher = make_launcher(answers=['4', '', '0'], tmp_path=tmp_path)
+    launcher.settings_menu()
+    assert imu.load_settings(
+        str(tmp_path / 'config' / 'launcher.json')) == imu.Settings()
+
+
+def test_start_fails_clearly_when_the_custom_network_is_missing(docker,
+                                                                tmp_path):
+    """Do not create the network; say how to make it exist."""
+    imu.save_settings(str(tmp_path / 'config' / 'launcher.json'),
+                      imu.Settings(network='compose_my_bridge_network'))
+    launcher = make_launcher(answers=['1', 'n'], tmp_path=tmp_path)
+    with pytest.raises(imu.LauncherError) as excinfo:
+        launcher.start('foxglove')
+    message = str(excinfo.value)
+    assert 'compose_my_bridge_network' in message
+    assert 'docker compose up' in message
+    assert 'run' not in docker.subcommands()
+    assert not any(c[0][1:3] == ['network', 'create'] for c in docker.calls)
+
+
+def test_start_joins_an_existing_custom_network(docker, tmp_path):
+    """Start normally when the custom network exists."""
+    docker.networks.append('compose_my_bridge_network')
+    imu.save_settings(str(tmp_path / 'config' / 'launcher.json'),
+                      imu.Settings(network='compose_my_bridge_network'))
+    launcher = make_launcher(answers=['1', 'n'], tmp_path=tmp_path)
+    launcher.start('foxglove')
+    args = docker.run_call()[0]
+    assert _has_pair(args, '--network', 'compose_my_bridge_network')
