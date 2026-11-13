@@ -1226,3 +1226,44 @@ def test_failed_guided_verification_does_not_mark_option_12(clock, tmp_path):
     steps = [(None, '12'), (None, ''), (_level(roll=2.0), ''), (None, 'q'), (None, '0')]
     rc, out, _ = _guided(clock, tmp_path, steps, color=True)
     assert cli.DONE_MARK not in _menu_blocks(out)[-1]
+
+
+# ----------------------------------- live values while waiting in the guide
+
+def test_guided_verification_shows_live_values_while_waiting(clock, tmp_path):
+    """On a terminal the current reading is shown so the user sees how far they turned."""
+    ser = FakeSerial(clock)
+    out = Output()
+    # (stream shown while waiting, text to wait for, stream at Enter, answer)
+    script = [
+        (None, None, None, '12'), (None, None, None, ''),
+        (_level(), 'roll(X)', None, ''),                  # level: live roll / pitch / yaw
+        (_level(10.0), 'yaw(Z)  +10.00°', None, ''),      # start direction
+        # While turning: 45 deg so far is visible before Enter is pressed.
+        (_level(55.0), 'Δyaw  +45.00°', _level(100.0), ''),
+        (None, None, None, 'q'), (None, None, None, '0'),
+    ]
+
+    def inp(prompt=''):
+        if not script:
+            raise EOFError
+        before, wait, at_enter, answer = script.pop(0)
+        if before is not None:
+            ser.stream = before
+        if wait:
+            _wait_for(out, wait)
+        if at_enter is not None:
+            ser.stream = at_enter
+        return answer
+    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
+                      sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    assert rc == 0
+    assert 'Δyaw  +45.00°' in out.text
+    assert '目標' in out.text
+    assert '第 1 次 Δyaw +90.00°' in out.text          # judged on the value at Enter
+    assert ser.writes == []
+
+
+def test_guided_verification_has_no_live_line_without_a_terminal(clock, tmp_path):
+    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
+    assert '\r' not in out.text

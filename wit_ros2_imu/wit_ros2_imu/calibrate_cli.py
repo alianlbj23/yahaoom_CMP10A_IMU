@@ -606,11 +606,58 @@ class CalibrationMenu:
         for line in self._verify_lines:
             self._out(line)
 
-    def _verify_prompt(self, text: str) -> bool:
+    def _ask_live(self, prompt: str, live=None) -> str:
+        """
+        Ask for input while one line below the prompt shows the current reading.
+
+        ``live(angles, height)`` formats that line; the default shows roll,
+        pitch, yaw and height.  Off a terminal this is a plain prompt.
+        """
+        if not self._color:
+            return self._ask(prompt)
+        self._out(prompt)
+        stop = threading.Event()
+
+        def reader() -> None:
+            parser = wp.FrameParser()
+            angles = None
+            height = None
+            next_status = self._time()
+            try:
+                while True:
+                    for p in self._read_stream(parser):
+                        if isinstance(p, wp.Angle):
+                            angles = (math.degrees(p.roll), math.degrees(p.pitch),
+                                      math.degrees(p.yaw))
+                        elif isinstance(p, wp.Pressure):
+                            height = p.height_m
+                    now = self._time()
+                    if now >= next_status:
+                        if angles is None:
+                            self._status('等待角度資料...')
+                        else:
+                            self._status((live or format_attitude)(angles, height))
+                        next_status = now + ATTITUDE_INTERVAL
+                    if stop.wait(READER_YIELD):
+                        break
+            except (serial.SerialException, OSError) as exc:
+                # The measurement taken after Enter reports the failure.
+                logger.error('reading IMU data for the live line failed: %s', exc)
+
+        thread = threading.Thread(target=reader, name='imu-verify-live', daemon=True)
+        thread.start()
+        try:
+            return self._ask('')
+        finally:
+            stop.set()
+            thread.join(READER_JOIN_TIMEOUT)
+            self._end_status()
+
+    def _verify_prompt(self, text: str, live=None) -> bool:
         """Return True to measure, False to skip; raise _VerifyQuit on q."""
         self._verify_redraw()
         while True:
-            cmd = self._ask(f'{text},然後按 Enter(s 略過 / q 結束):').lower()
+            cmd = self._ask_live(f'{text},然後按 Enter(s 略過 / q 結束):', live).lower()
             if cmd == '':
                 return True
             if cmd == 's':
@@ -618,6 +665,16 @@ class CalibrationMenu:
             if cmd == 'q':
                 raise _VerifyQuit
             self._out('請按 Enter、s 或 q。')
+
+    @staticmethod
+    def _live_yaw_from(reference: float, target: float = 90.0):
+        """Return a live-line formatter showing how far yaw moved from ``reference``."""
+        goal = f'±{target:.0f}°' if target else '0°'
+
+        def line(angles, height) -> str:
+            delta = wrap_degrees(angles[2] - reference)
+            return f'目前 Δyaw {delta:+7.2f}°(目標 {goal})  yaw(Z) {angles[2]:+7.2f}°'
+        return line
 
     def _sample_attitude(self):
         """Return ((roll, pitch, yaw) in deg or None, height in m or None)."""
@@ -668,7 +725,8 @@ class CalibrationMenu:
         start = prev = angles[2]
         all_ok = True
         for i in range(1, TURN_COUNT + 1):
-            if not self._verify_prompt(f'  第 {i}/{TURN_COUNT} 次:往同一個方向轉 90°'):
+            if not self._verify_prompt(f'  第 {i}/{TURN_COUNT} 次:往同一個方向轉 90°',
+                                       self._live_yaw_from(prev)):
                 self._record(results, SKIP, f'{name}:只做了 {i - 1} 次')
                 return None
             angles, _ = self._sample_attitude()
@@ -695,7 +753,8 @@ class CalibrationMenu:
             if first is None:
                 self._record(results, SKIP, f'{name}:未收到角度資料')
                 return
-            if not self._verify_prompt('  轉一整圈,對回同一條參考線'):
+            if not self._verify_prompt('  轉一整圈,對回同一條參考線',
+                                       self._live_yaw_from(first[2], target=0.0)):
                 self._record(results, SKIP, name)
                 return
             last, _ = self._sample_attitude()
@@ -719,7 +778,10 @@ class CalibrationMenu:
             self._record(results, SKIP, name)
             return
         _, low = self._sample_attitude()
-        if low is None or not self._verify_prompt(f'  垂直抬高 {HEIGHT_STEP_M:.0f} m'):
+        if low is None or not self._verify_prompt(
+                f'  垂直抬高 {HEIGHT_STEP_M:.0f} m',
+                lambda angles, height: '等待高度資料...' if height is None else
+                f'目前 Δ高度 {height - low:+6.2f} m(目標 +{HEIGHT_STEP_M:.0f} m)'):
             self._record(results, SKIP, name)
             return
         _, high = self._sample_attitude()
