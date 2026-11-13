@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import re
+import select
 import statistics
 import sys
 import threading
@@ -135,12 +136,21 @@ TURN_TOL_DEG = 3.0            # error allowed on a 90 deg turn and on a full tur
 TURN_COUNT = 4                # four 90 deg turns bring the IMU back to the start
 HEIGHT_STEP_M = 1.0
 HEIGHT_TOL_M = 0.5            # barometer noise is tens of centimetres
+# On a terminal a step finishes by itself once its reading passes and the IMU
+# has not moved more than AUTO_STILL_DEG for AUTO_HOLD_S.  Requiring it to hold
+# still keeps a turn from passing just because the reading swept through 90.
+AUTO_HOLD_S = 1.0
+AUTO_STILL_DEG = 1.0
 PASS, FAIL, SKIP = '合格', '不合格', '略過'
 ANSI_COLOURS = {PASS: '\033[32m', FAIL: '\033[31m', SKIP: '\033[33m'}
 ANSI_RESET = '\033[0m'
 VERIFY_INTRO = [
     '逐項驗證:每一步擺好後按 Enter,工具會量測並判定。s = 略過這一步,q = 結束驗證。',
     '合格標準為經驗值,不是原廠規格。',
+]
+VERIFY_AUTO_INTRO = [
+    f'數值進入合格範圍並保持不動 {AUTO_HOLD_S:.0f} 秒,會自動進下一步,不用按 Enter。',
+    '請把 IMU 靠著盒子擺到定位後停住;數值仍不合格時按 Enter,記錄為不合格。',
 ]
 VERIFY_FAIL_HINTS = [
     '不合格時先檢查:',
@@ -213,9 +223,16 @@ class CalibrationMenu:
 
     def __init__(self, ser, input_fn: Callable[[str], str], output_fn: Callable[..., None],
                  config_path, sleep_fn: Callable[[float], None] = time.sleep,
-                 time_fn: Callable[[], float] = time.monotonic, color: bool = False):
-        """Store the injected serial port, I/O functions and clock."""
+                 time_fn: Callable[[], float] = time.monotonic, color: bool = False,
+                 key_ready: Optional[Callable[[], bool]] = None):
+        """
+        Store the injected serial port, I/O functions and clock.
+
+        ``key_ready`` reports whether a typed line is waiting; when given, the
+        guided verification shows live values and can advance by itself.
+        """
         self._color = bool(color)
+        self._key_ready = key_ready
         self.ser = ser
         self._input = input_fn
         self._out = output_fn
@@ -606,62 +623,82 @@ class CalibrationMenu:
         for line in self._verify_lines:
             self._out(line)
 
-    def _ask_live(self, prompt: str, live=None) -> str:
+    def _poll_step(self, prompt: str, live, auto):
         """
-        Ask for input while one line below the prompt shows the current reading.
+        Show ``prompt`` with a live line until a key is typed or the step passes.
 
-        ``live(angles, height)`` formats that line; the default shows roll,
-        pitch, yaw and height.  Off a terminal this is a plain prompt.
+        Return ``(command, (angles, height))``.  ``command`` is 'auto' when
+        ``auto(angles, height)`` stayed true while the IMU held still for
+        AUTO_HOLD_S, otherwise the line the user typed.
         """
-        if not self._color:
-            return self._ask(prompt)
         self._out(prompt)
-        stop = threading.Event()
-
-        def reader() -> None:
-            parser = wp.FrameParser()
-            angles = None
-            height = None
-            next_status = self._time()
-            try:
-                while True:
-                    for p in self._read_stream(parser):
-                        if isinstance(p, wp.Angle):
-                            angles = (math.degrees(p.roll), math.degrees(p.pitch),
-                                      math.degrees(p.yaw))
-                        elif isinstance(p, wp.Pressure):
-                            height = p.height_m
-                    now = self._time()
-                    if now >= next_status:
-                        if angles is None:
-                            self._status('等待角度資料...')
-                        else:
-                            self._status((live or format_attitude)(angles, height))
-                        next_status = now + ATTITUDE_INTERVAL
-                    if stop.wait(READER_YIELD):
-                        break
-            except (serial.SerialException, OSError) as exc:
-                # The measurement taken after Enter reports the failure.
-                logger.error('reading IMU data for the live line failed: %s', exc)
-
-        thread = threading.Thread(target=reader, name='imu-verify-live', daemon=True)
-        thread.start()
+        parser = wp.FrameParser()
+        self.ser.reset_input_buffer()
+        angles = None
+        height = None
+        hold_start = None
+        hold_ref = None
+        next_status = self._time()
         try:
-            return self._ask('')
+            while True:
+                for p in self._read_stream(parser):
+                    if isinstance(p, wp.Angle):
+                        angles = (math.degrees(p.roll), math.degrees(p.pitch),
+                                  math.degrees(p.yaw))
+                    elif isinstance(p, wp.Pressure):
+                        height = p.height_m
+                        self._height_seen = True
+                now = self._time()
+                in_range = bool(auto) and angles is not None and auto(angles, height)
+                if not in_range:
+                    hold_start = None
+                elif hold_start is None or _moved(angles, hold_ref):
+                    hold_start, hold_ref = now, angles      # (re)start the hold
+                elif now - hold_start >= AUTO_HOLD_S:
+                    return 'auto', (angles, height)
+                if now >= next_status:
+                    if angles is None:
+                        line = '等待角度資料...'
+                    else:
+                        line = (live or format_attitude)(angles, height)
+                        if hold_start is not None:
+                            line += '  合格,保持不動'
+                    self._status(line)
+                    next_status = now + ATTITUDE_INTERVAL
+                if self._key_ready():
+                    return self._ask('').lower(), (angles, height)
         finally:
-            stop.set()
-            thread.join(READER_JOIN_TIMEOUT)
             self._end_status()
 
-    def _verify_prompt(self, text: str, live=None) -> bool:
-        """Return True to measure, False to skip; raise _VerifyQuit on q."""
+    def _verify_step(self, text: str, live=None, auto=None):
+        """
+        Run one prompt and return the measured ``(angles, height)``.
+
+        Return None when the step is skipped; raise _VerifyQuit on q.  On a
+        terminal a live line is shown and, when ``auto`` is given, the step
+        finishes by itself once the reading passes and the IMU holds still.
+        """
         self._verify_redraw()
+        polling = self._key_ready is not None
+        if polling and auto is not None:
+            prompt = (f'{text}(合格且不動 {AUTO_HOLD_S:.0f} 秒會自動進下一步;'
+                      'Enter 記錄目前數值 / s 略過 / q 結束):')
+        else:
+            prompt = f'{text},然後按 Enter(s 略過 / q 結束):'
         while True:
-            cmd = self._ask_live(f'{text},然後按 Enter(s 略過 / q 結束):', live).lower()
+            measured = None
+            if polling:
+                cmd, measured = self._poll_step(prompt, live, auto)
+            else:
+                cmd = self._ask(prompt).lower()
+            if cmd == 'auto':
+                return measured
             if cmd == '':
-                return True
+                if measured is None or measured[0] is None:
+                    measured = self._sample_attitude()
+                return measured
             if cmd == 's':
-                return False
+                return None
             if cmd == 'q':
                 raise _VerifyQuit
             self._out('請按 Enter、s 或 q。')
@@ -700,45 +737,50 @@ class CalibrationMenu:
 
     def _verify_level(self, results) -> None:
         name = '1. 水平'
-        if not self._verify_prompt('步驟 1/4 水平:把 IMU 放在水平面(用水平儀確認)'):
+        measured = self._verify_step(
+            '步驟 1/4 水平:把 IMU 放在水平面(用水平儀確認)',
+            auto=lambda angles, height: _level_ok(angles))
+        if measured is None:
             self._record(results, SKIP, name)
             return
-        angles, _ = self._sample_attitude()
+        angles, _ = measured
         if angles is None:
             self._record(results, SKIP, f'{name}:未收到角度資料')
             return
         roll, pitch, _ = angles
-        ok = abs(roll) <= LEVEL_TOL_DEG and abs(pitch) <= LEVEL_TOL_DEG
-        self._record(results, PASS if ok else FAIL,
+        self._record(results, PASS if _level_ok(angles) else FAIL,
                      f'{name}:roll {roll:+.2f}°  pitch {pitch:+.2f}°(標準 ±{LEVEL_TOL_DEG}°)')
 
     def _verify_turns(self, results) -> Optional[Tuple[float, float]]:
         """Four 90 deg turns; return (start yaw, end yaw) when all were measured."""
         name = '2. 每轉 90°'
-        if not self._verify_prompt('步驟 2/4 每轉 90°:IMU 靠著方形盒子的邊,擺好起始方向'):
+        measured = self._verify_step('步驟 2/4 每轉 90°:IMU 靠著方形盒子的邊,擺好起始方向')
+        if measured is None:
             self._record(results, SKIP, name)
             return None
-        angles, _ = self._sample_attitude()
-        if angles is None:
+        if measured[0] is None:
             self._record(results, SKIP, f'{name}:未收到角度資料')
             return None
-        start = prev = angles[2]
+        start = prev = measured[0][2]
         all_ok = True
         for i in range(1, TURN_COUNT + 1):
-            if not self._verify_prompt(f'  第 {i}/{TURN_COUNT} 次:往同一個方向轉 90°',
-                                       self._live_yaw_from(prev)):
+            reference = prev
+            measured = self._verify_step(
+                f'  第 {i}/{TURN_COUNT} 次:往同一個方向轉 90°,靠著盒子的邊擺好',
+                live=self._live_yaw_from(reference),
+                auto=lambda angles, height, ref=reference: _turn_ok(angles[2] - ref))
+            if measured is None:
                 self._record(results, SKIP, f'{name}:只做了 {i - 1} 次')
                 return None
-            angles, _ = self._sample_attitude()
-            if angles is None:
+            if measured[0] is None:
                 self._record(results, SKIP, f'{name}:未收到角度資料')
                 return None
-            delta = wrap_degrees(angles[2] - prev)
-            ok = abs(abs(delta) - 90.0) <= TURN_TOL_DEG
+            delta = wrap_degrees(measured[0][2] - prev)
+            ok = _turn_ok(delta)
             all_ok = all_ok and ok
             self._verify_note('  ' + self._mark(PASS if ok else FAIL,
                                                 f'第 {i} 次 Δyaw {delta:+.2f}°'))
-            prev = angles[2]
+            prev = measured[0][2]
         self._record(results, PASS if all_ok else FAIL,
                      f'{name}:{TURN_COUNT} 次(標準 90° ±{TURN_TOL_DEG:.0f}°)')
         return start, prev
@@ -746,24 +788,34 @@ class CalibrationMenu:
     def _verify_full_turn(self, results, turned: Optional[Tuple[float, float]]) -> None:
         name = '3. 轉一圈回原位'
         if turned is None:
-            if not self._verify_prompt('步驟 3/4 轉一圈:IMU 對齊桌上的參考線'):
-                self._record(results, SKIP, name)
-                return
-            first, _ = self._sample_attitude()
+            first = self._verify_step('步驟 3/4 轉一圈:IMU 對齊桌上的參考線')
             if first is None:
-                self._record(results, SKIP, f'{name}:未收到角度資料')
-                return
-            if not self._verify_prompt('  轉一整圈,對回同一條參考線',
-                                       self._live_yaw_from(first[2], target=0.0)):
                 self._record(results, SKIP, name)
                 return
-            last, _ = self._sample_attitude()
-            if last is None:
+            if first[0] is None:
                 self._record(results, SKIP, f'{name}:未收到角度資料')
                 return
-            turned = (first[2], last[2])
+            start = first[0][2]
+            left = {'away': False}      # it must turn away before coming back counts
+
+            def back_home(angles, height) -> bool:
+                delta = wrap_degrees(angles[2] - start)
+                if abs(delta) > 90.0:
+                    left['away'] = True
+                return left['away'] and abs(delta) <= TURN_TOL_DEG
+
+            last = self._verify_step('  轉一整圈,對回同一條參考線',
+                                     live=self._live_yaw_from(start, target=0.0),
+                                     auto=back_home)
+            if last is None:
+                self._record(results, SKIP, name)
+                return
+            if last[0] is None:
+                self._record(results, SKIP, f'{name}:未收到角度資料')
+                return
+            turned = (start, last[0][2])
         else:
-            self._out('步驟 3/4 轉一圈:四次轉完已回到起始方向,直接用來判定。')
+            self._verify_note('步驟 3/4 轉一圈:四次轉完已回到起始方向,直接用來判定。')
         delta = wrap_degrees(turned[1] - turned[0])
         ok = abs(delta) <= TURN_TOL_DEG
         self._record(results, PASS if ok else FAIL,
@@ -774,23 +826,24 @@ class CalibrationMenu:
         if not self._height_seen:
             self._record(results, SKIP, f'{name}:未收到高度資料,先用選項 13 開啟氣壓輸出')
             return
-        if not self._verify_prompt('步驟 4/4 高度:IMU 放在固定的高度'):
+        base = self._verify_step('步驟 4/4 高度:IMU 放在固定的高度')
+        if base is None or base[1] is None:
             self._record(results, SKIP, name)
             return
-        _, low = self._sample_attitude()
-        if low is None or not self._verify_prompt(
-                f'  垂直抬高 {HEIGHT_STEP_M:.0f} m',
-                lambda angles, height: '等待高度資料...' if height is None else
-                f'目前 Δ高度 {height - low:+6.2f} m(目標 +{HEIGHT_STEP_M:.0f} m)'):
+        low = base[1]
+        raised = self._verify_step(
+            f'  垂直抬高 {HEIGHT_STEP_M:.0f} m',
+            live=lambda angles, height: '等待高度資料...' if height is None else
+            f'目前 Δ高度 {height - low:+6.2f} m(目標 +{HEIGHT_STEP_M:.0f} m)',
+            auto=lambda angles, height: height is not None and _height_ok(height - low))
+        if raised is None:
             self._record(results, SKIP, name)
             return
-        _, high = self._sample_attitude()
-        if high is None:
+        if raised[1] is None:
             self._record(results, SKIP, f'{name}:未收到高度資料')
             return
-        delta = high - low
-        ok = abs(delta - HEIGHT_STEP_M) <= HEIGHT_TOL_M
-        self._record(results, PASS if ok else FAIL,
+        delta = raised[1] - low
+        self._record(results, PASS if _height_ok(delta) else FAIL,
                      f'{name}:Δ高度 {delta:+.2f} m'
                      f'(標準 +{HEIGHT_STEP_M:.0f} m ±{HEIGHT_TOL_M} m)')
 
@@ -799,6 +852,9 @@ class CalibrationMenu:
         self._verify_lines: List[str] = []
         for line in VERIFY_INTRO:
             self._verify_note(line)
+        if self._key_ready is not None:
+            for line in VERIFY_AUTO_INTRO:
+                self._verify_note(line)
         self._height_seen = False
         results: List[Tuple[str, str]] = []
         try:
@@ -1002,6 +1058,23 @@ def format_attitude(angles, height: Optional[float], ref=None) -> str:
     return f'Δroll(X) {dr:+7.2f}°  Δpitch(Y) {dp:+7.2f}°  Δyaw(Z) {dy:+7.2f}°  {dh}'
 
 
+def _level_ok(angles) -> bool:
+    return abs(angles[0]) <= LEVEL_TOL_DEG and abs(angles[1]) <= LEVEL_TOL_DEG
+
+
+def _turn_ok(delta_yaw: float) -> bool:
+    return abs(abs(wrap_degrees(delta_yaw)) - 90.0) <= TURN_TOL_DEG
+
+
+def _height_ok(delta_m: float) -> bool:
+    return abs(delta_m - HEIGHT_STEP_M) <= HEIGHT_TOL_M
+
+
+def _moved(angles, reference) -> bool:
+    """Return True if any angle changed by more than AUTO_STILL_DEG."""
+    return any(abs(wrap_degrees(a - b)) > AUTO_STILL_DEG for a, b in zip(angles, reference))
+
+
 def render_menu(done=(), color: bool = False) -> str:
     """Return the menu with the rows in ``done`` marked (green on a terminal)."""
     lines = []
@@ -1053,10 +1126,20 @@ def _format_live(angle: wp.Angle, acc: Optional[wp.Accel], gyro: Optional[wp.Gyr
 def run_menu(ser, input_fn: Callable[[str], str] = input,
              output_fn: Callable[..., None] = print, config_path=DEFAULT_CONFIG, *,
              sleep_fn: Callable[[float], None] = time.sleep,
-             time_fn: Callable[[], float] = time.monotonic, color: bool = False) -> int:
+             time_fn: Callable[[], float] = time.monotonic, color: bool = False,
+             key_ready: Optional[Callable[[], bool]] = None) -> int:
     """Run the interactive menu on an already opened serial port."""
     return CalibrationMenu(ser, input_fn, output_fn, config_path,
-                           sleep_fn=sleep_fn, time_fn=time_fn, color=color).run()
+                           sleep_fn=sleep_fn, time_fn=time_fn, color=color,
+                           key_ready=key_ready).run()
+
+
+def stdin_ready() -> bool:
+    """Return True when a typed line is waiting on standard input."""
+    try:
+        return bool(select.select([sys.stdin], [], [], 0)[0])
+    except (OSError, ValueError):
+        return False
 
 
 def use_color(stream=None, environ=None) -> bool:
@@ -1111,7 +1194,9 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 1
     try:
-        return run_menu(ser, input, print, args.config, color=use_color())
+        terminal = use_color()
+        return run_menu(ser, input, print, args.config, color=terminal,
+                        key_ready=stdin_ready if terminal else None)
     finally:
         ser.close()
 

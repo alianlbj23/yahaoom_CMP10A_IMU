@@ -1228,42 +1228,117 @@ def test_failed_guided_verification_does_not_mark_option_12(clock, tmp_path):
     assert cli.DONE_MARK not in _menu_blocks(out)[-1]
 
 
-# ----------------------------------- live values while waiting in the guide
+# ------------------------- auto-advance and live values on a terminal (12)
+
+class _AutoRun:
+    """
+    Drive the guided verification the way a terminal does.
+
+    ``steps`` has one entry per verification prompt: (stream, key).  ``stream``
+    is what the IMU sends during that prompt; ``key`` is the line typed
+    (None = nothing is typed, so only auto-advance can finish the step).
+    """
+
+    def __init__(self, clock, tmp_path, steps, menu_answers=('12', ''), max_reads=4000):
+        self.ser = FakeSerial(clock)
+        self.steps = list(steps)
+        self.pending_key = None
+        self.answers = list(menu_answers)
+        self.lines = []
+        self.reads_left = max_reads
+        real_read = self.ser.read
+
+        def guarded_read(size=1):
+            self.reads_left -= 1
+            if self.reads_left < 0:          # a step that never ends would hang the test
+                raise AssertionError('guided verification did not advance:\n'
+                                     + self.text[-1500:])
+            return real_read(size)
+        self.ser.read = guarded_read
+        self.rc = cli.run_menu(self.ser, self._input, self._output, tmp_path / 'c.yaml',
+                               sleep_fn=clock.sleep, time_fn=clock.time, color=True,
+                               key_ready=lambda: self.pending_key is not None)
+
+    def _output(self, *args, **kwargs):
+        line = ' '.join(str(a) for a in args)
+        self.lines.append(line)
+        if 's 略過' in line and self.steps:    # a verification prompt was just shown
+            stream, key = self.steps.pop(0)
+            if stream is not None:
+                self.ser.stream = stream
+            self.pending_key = key
+
+    def _input(self, prompt=''):
+        if self.pending_key is not None:
+            key, self.pending_key = self.pending_key, None
+            return key
+        if self.answers:
+            return self.answers.pop(0)
+        return '0'
+
+    @property
+    def text(self):
+        return '\n'.join(self.lines)
+
+
+def test_guided_verification_advances_by_itself_when_in_range(clock, tmp_path):
+    """Level and each 90 degree turn finish without Enter once the reading passes."""
+    run = _AutoRun(clock, tmp_path, [
+        (_level(), None),                    # 1 level: passes on its own
+        (_level(10.0), ''),                  # start direction: Enter (nothing to judge)
+        (_level(100.5), None), (_level(-169.0), None),
+        (_level(-80.0), None), (_level(11.0), None),
+    ])
+    assert run.rc == 0
+    assert '[合格] 1. 水平' in run.text
+    assert '[合格] 2. 每轉 90°' in run.text
+    assert '[合格] 3. 轉一圈回原位' in run.text
+    assert '[不合格]' not in run.text
+    assert run.ser.writes == []
+
+
+def test_guided_verification_waits_while_out_of_range_then_enter_records(clock, tmp_path):
+    """A reading outside the range never auto-advances; Enter records the failure."""
+    run = _AutoRun(clock, tmp_path, [
+        (_level(), None),
+        (_level(0.0), ''),
+        (_level(80.0), ''),                  # only 80 deg: the user gives up and presses Enter
+        (None, 'q'),
+    ])
+    assert '第 1 次 Δyaw +80.00°' in run.text
+    assert '[不合格]' in run.text
+    assert '[合格] 2. 每轉 90°' not in run.text
+
+
+def test_guided_verification_does_not_advance_while_still_moving(clock, tmp_path):
+    """Passing through the range while turning must not count: it has to hold still."""
+    frames = b''.join(_level(88.0 + 0.5 * (i % 8) * 4) for i in range(8))   # 88..102, jumping
+    run = _AutoRun(clock, tmp_path, [
+        (_level(), None),
+        (_level(0.0), ''),
+        (frames, 'q'),                       # never steady, so q is what ends the step
+    ], max_reads=400)
+    assert '第 1 次' not in run.text
+    assert '已結束驗證' in run.text or '== 驗證結果 ==' in run.text
+
 
 def test_guided_verification_shows_live_values_while_waiting(clock, tmp_path):
-    """On a terminal the current reading is shown so the user sees how far they turned."""
-    ser = FakeSerial(clock)
-    out = Output()
-    # (stream shown while waiting, text to wait for, stream at Enter, answer)
-    script = [
-        (None, None, None, '12'), (None, None, None, ''),
-        (_level(), 'roll(X)', None, ''),                  # level: live roll / pitch / yaw
-        (_level(10.0), 'yaw(Z)  +10.00°', None, ''),      # start direction
-        # While turning: 45 deg so far is visible before Enter is pressed.
-        (_level(55.0), 'Δyaw  +45.00°', _level(100.0), ''),
-        (None, None, None, 'q'), (None, None, None, '0'),
-    ]
+    """The line under the prompt shows the current change and its target."""
+    run = _AutoRun(clock, tmp_path, [
+        (_level(), None),
+        (_level(10.0), ''),
+        (_level(55.0), 'q'),                 # half way: 45 deg so far, then quit
+    ])
+    assert 'roll(X)' in run.text
+    assert 'Δyaw  +45.00°' in run.text and '目標 ±90°' in run.text
 
-    def inp(prompt=''):
-        if not script:
-            raise EOFError
-        before, wait, at_enter, answer = script.pop(0)
-        if before is not None:
-            ser.stream = before
-        if wait:
-            _wait_for(out, wait)
-        if at_enter is not None:
-            ser.stream = at_enter
-        return answer
-    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
-                      sleep_fn=clock.sleep, time_fn=clock.time, color=True)
-    assert rc == 0
-    assert 'Δyaw  +45.00°' in out.text
-    assert '目標' in out.text
-    assert '第 1 次 Δyaw +90.00°' in out.text          # judged on the value at Enter
-    assert ser.writes == []
+
+def test_guided_verification_prompt_explains_auto_advance(clock, tmp_path):
+    run = _AutoRun(clock, tmp_path, [(_level(), None), (None, 'q')])
+    assert '自動' in run.text
 
 
 def test_guided_verification_has_no_live_line_without_a_terminal(clock, tmp_path):
     rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
     assert '\r' not in out.text
+    assert '自動' not in out.text             # plain prompts: Enter is always required
