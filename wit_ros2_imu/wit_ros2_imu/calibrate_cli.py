@@ -24,17 +24,19 @@ import argparse
 import dataclasses
 import logging
 import math
+import os
 import statistics
 import sys
 import threading
 import time
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import serial
 
 from . import wit_protocol as wp
 from .calibration import (compute_mag_offset, compute_static_bias, load_calibration,
-                          MagCoverage, MIN_SAMPLES, save_calibration, SoftwareCalibration)
+                          MAG_COVERAGE_TARGET, MagCoverage, MIN_SAMPLES, save_calibration,
+                          SoftwareCalibration)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,17 @@ STATIC_SAMPLES = 50         # accel + gyro samples for software static calibrati
 STATIC_TIMEOUT = 20.0
 SOFT_MAG_TIMEOUT = 90.0     # s; software hard-iron sampling ends earlier once all axes are covered
 SOFT_MAG_COVERAGE_TARGET = 0.95   # auto-stop needs both extremes for (max+min)/2
+# Dual-plane turns keep one axis in the horizontal plane, where it only sees
+# the horizontal part of the inclined geomagnetic field: cos(inclination) of
+# the full swing (about 0.80 in Taiwan).  0.70 stays reachable up to 45 deg.
+DUAL_PLANE_COVERAGE_TARGET = 0.70
+DUAL_PLANE_STEPS = [
+    '開始後請先將 IMU(連同機器人)水平繞 Z 軸緩慢轉一圈,再立起繞 X 或 Y 軸轉一圈;',
+    '若不確定,繞三軸緩慢轉動即可。',
+    '雙平面的轉法掃不滿每一軸的全部範圍,進度條已依此放寬;',
+    '某一軸仍停在九成左右時可直接按 Enter 結束,再用選項 12 驗證。',
+    '進度長時間不動,通常是附近有鐵件或電器干擾,請移開後重做。',
+]
 FIELD_MEASURE_TIME = 1.5    # s of normal-mode data used to measure |B| before a mag calibration
 LARGE_ACCEL_BIAS = 1.0      # m/s^2; above this the IMU was probably not level
 
@@ -69,6 +82,9 @@ ATTITUDE_INTERVAL = 0.2     # s between attitude-view refreshes
 PRESS_BIT = 1 << 6          # RSW bit enabling the 0x56 pressure / height packet
 AXIS_BAR_WIDTH = 8          # per-axis bars; keeps the status line within 79 columns
 CLEAR_EOL = '\x1b[K'
+CLEAR_SCREEN = '\x1b[2J\x1b[H'
+# Take back the line break the terminal echoed for Enter, so a view keeps one line.
+CURSOR_UP_CLEAR = '\x1b[A\r\x1b[2K'
 
 # Offset registers shown by "read offsets" (read-only).
 OFFSET_REGISTERS = [
@@ -103,6 +119,32 @@ ATTITUDE_HELP = [
     '  3. 對齊桌上的參考線按 Enter,轉一圈再對回:Δyaw 回到 0,誤差 ±3° 內。',
     '  4. 按 Enter 後抬高 1 m:Δ高度 約 +1 m(氣壓計有數十公分雜訊;需先用 13 開啟高度輸出)。',
 ]
+
+# Guided verification (option 12): tolerances are rules of thumb for this module.
+VERIFY_SAMPLE_TIME = 1.0      # s of fresh data read after each Enter
+LEVEL_TOL_DEG = 0.5           # |roll|, |pitch| on a level surface
+TURN_TOL_DEG = 3.0            # error allowed on a 90 deg turn and on a full turn
+TURN_COUNT = 4                # four 90 deg turns bring the IMU back to the start
+HEIGHT_STEP_M = 1.0
+HEIGHT_TOL_M = 0.5            # barometer noise is tens of centimetres
+PASS, FAIL, SKIP = '合格', '不合格', '略過'
+ANSI_COLOURS = {PASS: '\033[32m', FAIL: '\033[31m', SKIP: '\033[33m'}
+ANSI_RESET = '\033[0m'
+VERIFY_INTRO = [
+    '逐項驗證:每一步擺好後按 Enter,工具會量測並判定。s = 略過這一步,q = 結束驗證。',
+    '合格標準為經驗值,不是原廠規格。',
+]
+VERIFY_FAIL_HINTS = [
+    '不合格時先檢查:',
+    '  - 水平:桌面是否確實水平(水平儀);必要時重做選項 2。',
+    '  - 轉 90° / 轉一圈:周圍 20 cm 內是否有電器、通電的線、手機、鐵製品;重做選項 3 或 4。',
+    '  - 高度:氣壓計有數十公分雜訊,可重測一次;先用選項 7 歸零。',
+]
+
+
+class _VerifyQuit(Exception):
+    """Raised inside the guided verification when the user enters q."""
+
 
 # Shown before every magnetometer calibration that displays per-axis progress.
 MAG_PROGRESS_HELP = [
@@ -163,8 +205,9 @@ class CalibrationMenu:
 
     def __init__(self, ser, input_fn: Callable[[str], str], output_fn: Callable[..., None],
                  config_path, sleep_fn: Callable[[float], None] = time.sleep,
-                 time_fn: Callable[[], float] = time.monotonic):
+                 time_fn: Callable[[], float] = time.monotonic, color: bool = False):
         """Store the injected serial port, I/O functions and clock."""
+        self._color = bool(color)
         self.ser = ser
         self._input = input_fn
         self._out = output_fn
@@ -172,6 +215,8 @@ class CalibrationMenu:
         self._sleep = sleep_fn
         self._time = time_fn
         self._unlock_time: Optional[float] = None
+        self._height_seen = False
+        self._verify_lines: List[str] = []
         self._actions = {
             '1': self.live_view,
             '2': self.hw_accel,
@@ -289,7 +334,8 @@ class CalibrationMenu:
                     norms.append(n)
         return statistics.median(norms) if norms else None
 
-    def _wait_mag_coverage(self, field_radius: Optional[float]) -> None:
+    def _wait_mag_coverage(self, field_radius: Optional[float],
+                           target: float = MAG_COVERAGE_TARGET) -> None:
         """
         Wait for Enter while a reader thread shows per-axis magnetometer coverage.
 
@@ -298,7 +344,7 @@ class CalibrationMenu:
         KeyboardInterrupt / EOFError from the prompt propagate to the caller
         after the reader thread has been stopped.
         """
-        cov = MagCoverage(field_radius)
+        cov = MagCoverage(field_radius, target=target)
         stop = threading.Event()
         errors: List[BaseException] = []
 
@@ -352,7 +398,7 @@ class CalibrationMenu:
         self._send(wp.cmd_calsw(mode))
         try:
             if mag_progress:
-                self._wait_mag_coverage(field_radius)
+                self._wait_mag_coverage(field_radius, mag_coverage_target(mode))
             elif wait_s > 0:
                 self._countdown(wait_s, '校正中,請保持不動')
         except (KeyboardInterrupt, EOFError):
@@ -395,8 +441,7 @@ class CalibrationMenu:
     def hw_mag(self, mode: wp.CalMode, title: str) -> None:
         """Hardware magnetometer calibration (sphere fit or dual plane)."""
         if mode == wp.CalMode.MAG_DUAL_PLANE:
-            steps = ['開始後請先將 IMU 水平繞 Z 軸緩慢轉一圈,再立起繞 X 或 Y 軸轉一圈;',
-                     '若不確定,繞三軸緩慢轉動即可。']
+            steps = list(DUAL_PLANE_STEPS)
         else:
             steps = ['開始後請將 IMU 繞三軸緩慢轉動(X、Y、Z 各轉數圈),遠離金屬與磁鐵。']
         steps += MAG_PROGRESS_HELP
@@ -518,8 +563,194 @@ class CalibrationMenu:
         self._save(cal)
 
     def attitude_view(self) -> None:
-        """Show live roll / pitch / yaw / height, optionally relative to a reference."""
+        """Verify the calibration step by step, or open the free live view."""
         self._out('== 姿態檢視 / 校正驗證(唯讀)==')
+        cmd = self._ask('Enter = 逐項驗證(建議)  f = 自由檢視  q = 返回:').lower()
+        if cmd == 'q':
+            return
+        if cmd == 'f':
+            self._attitude_free_view()
+            return
+        self.guided_verify()
+
+    # ------------------------------------------------- guided verification
+
+    def _mark(self, status: str, text: str) -> str:
+        line = f'[{status}] {text}'
+        if self._color:
+            return f'{ANSI_COLOURS[status]}{line}{ANSI_RESET}'
+        return line
+
+    def _verify_redraw(self, title: str = '== 逐項驗證 ==') -> None:
+        """On a terminal, clear the screen and show only what is still relevant."""
+        if not self._color:
+            return
+        self._out(CLEAR_SCREEN + title)
+        for line in self._verify_lines:
+            self._out(line)
+
+    def _verify_prompt(self, text: str) -> bool:
+        """Return True to measure, False to skip; raise _VerifyQuit on q."""
+        self._verify_redraw()
+        while True:
+            cmd = self._ask(f'{text},然後按 Enter(s 略過 / q 結束):').lower()
+            if cmd == '':
+                return True
+            if cmd == 's':
+                return False
+            if cmd == 'q':
+                raise _VerifyQuit
+            self._out('請按 Enter、s 或 q。')
+
+    def _sample_attitude(self):
+        """Return ((roll, pitch, yaw) in deg or None, height in m or None)."""
+        angles = None
+        height = None
+        for p in self._packets_for(VERIFY_SAMPLE_TIME):
+            if isinstance(p, wp.Angle):
+                angles = (math.degrees(p.roll), math.degrees(p.pitch), math.degrees(p.yaw))
+            elif isinstance(p, wp.Pressure):
+                height = p.height_m
+        if height is not None:
+            self._height_seen = True
+        return angles, height
+
+    def _record(self, results: List[Tuple[str, str]], status: str, text: str) -> None:
+        results.append((status, text))
+        self._verify_note(self._mark(status, text))
+
+    def _verify_note(self, line: str) -> None:
+        """Print a line and keep it for the next redraw."""
+        self._verify_lines.append(line)
+        self._out(line)
+
+    def _verify_level(self, results) -> None:
+        name = '1. 水平'
+        if not self._verify_prompt('步驟 1/4 水平:把 IMU 放在水平面(用水平儀確認)'):
+            self._record(results, SKIP, name)
+            return
+        angles, _ = self._sample_attitude()
+        if angles is None:
+            self._record(results, SKIP, f'{name}:未收到角度資料')
+            return
+        roll, pitch, _ = angles
+        ok = abs(roll) <= LEVEL_TOL_DEG and abs(pitch) <= LEVEL_TOL_DEG
+        self._record(results, PASS if ok else FAIL,
+                     f'{name}:roll {roll:+.2f}°  pitch {pitch:+.2f}°(標準 ±{LEVEL_TOL_DEG}°)')
+
+    def _verify_turns(self, results) -> Optional[Tuple[float, float]]:
+        """Four 90 deg turns; return (start yaw, end yaw) when all were measured."""
+        name = '2. 每轉 90°'
+        if not self._verify_prompt('步驟 2/4 每轉 90°:IMU 靠著方形盒子的邊,擺好起始方向'):
+            self._record(results, SKIP, name)
+            return None
+        angles, _ = self._sample_attitude()
+        if angles is None:
+            self._record(results, SKIP, f'{name}:未收到角度資料')
+            return None
+        start = prev = angles[2]
+        all_ok = True
+        for i in range(1, TURN_COUNT + 1):
+            if not self._verify_prompt(f'  第 {i}/{TURN_COUNT} 次:往同一個方向轉 90°'):
+                self._record(results, SKIP, f'{name}:只做了 {i - 1} 次')
+                return None
+            angles, _ = self._sample_attitude()
+            if angles is None:
+                self._record(results, SKIP, f'{name}:未收到角度資料')
+                return None
+            delta = wrap_degrees(angles[2] - prev)
+            ok = abs(abs(delta) - 90.0) <= TURN_TOL_DEG
+            all_ok = all_ok and ok
+            self._verify_note('  ' + self._mark(PASS if ok else FAIL,
+                                                f'第 {i} 次 Δyaw {delta:+.2f}°'))
+            prev = angles[2]
+        self._record(results, PASS if all_ok else FAIL,
+                     f'{name}:{TURN_COUNT} 次(標準 90° ±{TURN_TOL_DEG:.0f}°)')
+        return start, prev
+
+    def _verify_full_turn(self, results, turned: Optional[Tuple[float, float]]) -> None:
+        name = '3. 轉一圈回原位'
+        if turned is None:
+            if not self._verify_prompt('步驟 3/4 轉一圈:IMU 對齊桌上的參考線'):
+                self._record(results, SKIP, name)
+                return
+            first, _ = self._sample_attitude()
+            if first is None:
+                self._record(results, SKIP, f'{name}:未收到角度資料')
+                return
+            if not self._verify_prompt('  轉一整圈,對回同一條參考線'):
+                self._record(results, SKIP, name)
+                return
+            last, _ = self._sample_attitude()
+            if last is None:
+                self._record(results, SKIP, f'{name}:未收到角度資料')
+                return
+            turned = (first[2], last[2])
+        else:
+            self._out('步驟 3/4 轉一圈:四次轉完已回到起始方向,直接用來判定。')
+        delta = wrap_degrees(turned[1] - turned[0])
+        ok = abs(delta) <= TURN_TOL_DEG
+        self._record(results, PASS if ok else FAIL,
+                     f'{name}:Δyaw {delta:+.2f}°(標準 0° ±{TURN_TOL_DEG:.0f}°)')
+
+    def _verify_height(self, results) -> None:
+        name = '4. 高度'
+        if not self._height_seen:
+            self._record(results, SKIP, f'{name}:未收到高度資料,先用選項 13 開啟氣壓輸出')
+            return
+        if not self._verify_prompt('步驟 4/4 高度:IMU 放在固定的高度'):
+            self._record(results, SKIP, name)
+            return
+        _, low = self._sample_attitude()
+        if low is None or not self._verify_prompt(f'  垂直抬高 {HEIGHT_STEP_M:.0f} m'):
+            self._record(results, SKIP, name)
+            return
+        _, high = self._sample_attitude()
+        if high is None:
+            self._record(results, SKIP, f'{name}:未收到高度資料')
+            return
+        delta = high - low
+        ok = abs(delta - HEIGHT_STEP_M) <= HEIGHT_TOL_M
+        self._record(results, PASS if ok else FAIL,
+                     f'{name}:Δ高度 {delta:+.2f} m'
+                     f'(標準 +{HEIGHT_STEP_M:.0f} m ±{HEIGHT_TOL_M} m)')
+
+    def guided_verify(self) -> None:
+        """Walk through the verification checks one by one and judge each (read-only)."""
+        self._verify_lines: List[str] = []
+        for line in VERIFY_INTRO:
+            self._verify_note(line)
+        self._height_seen = False
+        results: List[Tuple[str, str]] = []
+        try:
+            self._verify_level(results)
+            turned = self._verify_turns(results)
+            self._verify_full_turn(results, turned)
+            self._verify_height(results)
+        except _VerifyQuit:
+            self._out('已結束驗證。')
+        except (serial.SerialException, OSError) as exc:
+            logger.error('reading IMU data in guided verification failed: %s', exc)
+            self._out(f'讀取 IMU 資料失敗:{exc}')
+        if not results:
+            return
+        if self._color:
+            self._out(CLEAR_SCREEN + '== 驗證結果 ==')
+        else:
+            self._out('== 驗證結果 ==')
+        for status, text in results:
+            self._out(self._mark(status, text))
+        statuses = [status for status, _ in results]
+        if FAIL in statuses:
+            for line in VERIFY_FAIL_HINTS:
+                self._out(line)
+        elif PASS in statuses and SKIP not in statuses:
+            self._out(self._mark(PASS, '全部合格'))
+        elif PASS in statuses:
+            self._out('已做的項目都合格;略過的項目尚未驗證。')
+
+    def _attitude_free_view(self) -> None:
+        """Show live roll / pitch / yaw / height, optionally relative to a reference."""
         for line in ATTITUDE_HELP:
             self._out(line)
         lock = threading.Lock()
@@ -559,10 +790,14 @@ class CalibrationMenu:
                 cmd = self._ask('').lower()
                 if cmd == 'q':
                     break
+                if self._color:
+                    # Keep a single updating line: undo the echoed line break.
+                    self._out(CURSOR_UP_CLEAR, end='', flush=True)
                 if cmd == 'r':
                     with lock:
                         state['ref'] = None
-                    self._out('已清除參考點,顯示目前值。')
+                    if not self._color:
+                        self._out('已清除參考點,顯示目前值。')
                 elif cmd == '':
                     with lock:
                         angles, height = state['angles'], state['height']
@@ -570,7 +805,7 @@ class CalibrationMenu:
                             state['ref'] = (angles, height)
                     if angles is None:
                         self._out('尚未收到角度資料,無法設定參考點。')
-                    else:
+                    elif not self._color:
                         self._out('參考點已設定:' + format_attitude(angles, height))
                 else:
                     self._out(f'無效的指令 {cmd!r}:Enter 設定參考點、r 清除、q 離開。')
@@ -682,6 +917,13 @@ def format_attitude(angles, height: Optional[float], ref=None) -> str:
     return f'Δroll(X) {dr:+7.2f}°  Δpitch(Y) {dp:+7.2f}°  Δyaw(Z) {dy:+7.2f}°  {dh}'
 
 
+def mag_coverage_target(mode: wp.CalMode) -> float:
+    """Return the per-axis swing fraction that counts as done for ``mode``."""
+    if mode == wp.CalMode.MAG_DUAL_PLANE:
+        return DUAL_PLANE_COVERAGE_TARGET
+    return MAG_COVERAGE_TARGET
+
+
 def progress_bar(fraction: float, width: int = PROGRESS_WIDTH) -> str:
     """Return an ASCII progress bar such as ``[#####-----]  50%`` (input clamped to 0..1)."""
     if not math.isfinite(fraction):
@@ -713,10 +955,20 @@ def _format_live(angle: wp.Angle, acc: Optional[wp.Accel], gyro: Optional[wp.Gyr
 def run_menu(ser, input_fn: Callable[[str], str] = input,
              output_fn: Callable[..., None] = print, config_path=DEFAULT_CONFIG, *,
              sleep_fn: Callable[[float], None] = time.sleep,
-             time_fn: Callable[[], float] = time.monotonic) -> int:
+             time_fn: Callable[[], float] = time.monotonic, color: bool = False) -> int:
     """Run the interactive menu on an already opened serial port."""
     return CalibrationMenu(ser, input_fn, output_fn, config_path,
-                           sleep_fn=sleep_fn, time_fn=time_fn).run()
+                           sleep_fn=sleep_fn, time_fn=time_fn, color=color).run()
+
+
+def use_color(stream=None, environ=None) -> bool:
+    """Return True when ANSI colours suit ``stream`` (a TTY and NO_COLOR unset)."""
+    stream = sys.stdout if stream is None else stream
+    environ = os.environ if environ is None else environ
+    if environ.get('NO_COLOR'):
+        return False
+    isatty = getattr(stream, 'isatty', None)
+    return bool(isatty and isatty())
 
 
 def _baud(text: str) -> int:
@@ -761,7 +1013,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 1
     try:
-        return run_menu(ser, input, print, args.config)
+        return run_menu(ser, input, print, args.config, color=use_color())
     finally:
         ser.close()
 

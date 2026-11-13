@@ -83,6 +83,18 @@ def test_save_then_load_roundtrip(tmp_path):
     assert loaded.mag_offset == pytest.approx(original.mag_offset)
 
 
+def test_saved_file_is_readable_by_other_users(tmp_path):
+    """
+    The file must stay readable on the host.
+
+    The calibration tool runs as root inside the container and writes into a
+    bind mount, so an owner-only file cannot be read by the host user.
+    """
+    path = tmp_path / 'imu_calibration.yaml'
+    cal.save_calibration(path, cal.SoftwareCalibration())
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
 def test_saved_file_matches_spec_format(tmp_path):
     path = tmp_path / 'c.yaml'
     cal.save_calibration(path, cal.SoftwareCalibration(gyro_bias=(1, 2, 3)))

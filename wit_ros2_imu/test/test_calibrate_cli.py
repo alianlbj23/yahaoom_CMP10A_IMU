@@ -14,6 +14,7 @@
 
 """Tests for the interactive calibration CLI using a fake serial port."""
 
+import math
 import struct
 
 import pytest
@@ -828,7 +829,7 @@ def _run_with_watcher(ser, clock, tmp_path, script):
 def test_attitude_view_shows_live_angles_and_height_then_quits(clock, tmp_path):
     ser = FakeSerial(clock, stream=_attitude_stream())
     rc, out = _run_with_watcher(ser, clock, tmp_path,
-                                ['12', ('wait', '高度  +12.34 m'), 'q', '0'])
+                                ['12', 'f', ('wait', '高度  +12.34 m'), 'q', '0'])
     assert rc == 0
     assert ser.writes == []                    # read-only
     assert 'roll(X)   +1.00°' in out.text
@@ -838,7 +839,7 @@ def test_attitude_view_shows_live_angles_and_height_then_quits(clock, tmp_path):
 def test_attitude_view_enter_sets_reference_and_r_clears_it(clock, tmp_path):
     ser = FakeSerial(clock, stream=_attitude_stream(yaw=30.0))
     rc, out = _run_with_watcher(ser, clock, tmp_path, [
-        '12', ('wait', 'yaw(Z)  +30.00°'), '', ('wait', 'Δyaw(Z)   +0.00°'), 'r',
+        '12', 'f', ('wait', 'yaw(Z)  +30.00°'), '', ('wait', 'Δyaw(Z)   +0.00°'), 'r',
         'q', '0'])
     assert rc == 0
     assert '參考點已設定' in out.text
@@ -848,14 +849,14 @@ def test_attitude_view_enter_sets_reference_and_r_clears_it(clock, tmp_path):
 
 def test_attitude_view_reference_needs_data(clock, tmp_path):
     ser = FakeSerial(clock)                      # no data at all
-    rc, out = _run_with_watcher(ser, clock, tmp_path, ['12', '', 'q', '0'])
+    rc, out = _run_with_watcher(ser, clock, tmp_path, ['12', 'f', '', 'q', '0'])
     assert rc == 0
     assert '尚未收到角度資料' in out.text
 
 
 def test_attitude_view_explains_how_to_verify(clock, tmp_path):
     ser = FakeSerial(clock)
-    rc, out = _run_with_watcher(ser, clock, tmp_path, ['12', 'q', '0'])
+    rc, out = _run_with_watcher(ser, clock, tmp_path, ['12', 'f', 'q', '0'])
     assert '90°' in out.text and '轉一圈' in out.text
 
 
@@ -884,7 +885,7 @@ def test_attitude_view_serial_error_is_reported(clock, tmp_path):
             raise serial.SerialException('read failed')
 
     ser = Broken(clock)
-    rc, out, _ = run(ser, ['12', 'q', '0'], clock, tmp_path)
+    rc, out, _ = run(ser, ['12', 'f', 'q', '0'], clock, tmp_path)
     assert rc == 0
     assert 'read failed' in out.text
 
@@ -933,3 +934,210 @@ def test_pressure_output_toggle_read_timeout_writes_nothing(clock, tmp_path):
 
 def test_height_zero_notes_point_to_pressure_toggle():
     assert any('13' in line for line in cli.NOTES['7'])
+
+
+def _coverage_after_dual_plane(target):
+    """Coverage after a level turn and an upright turn at 37 deg inclination."""
+    field = 5000.0
+    horizontal = field * math.cos(math.radians(37.0))
+    vertical = field * math.sin(math.radians(37.0))
+    cov = cal.MagCoverage(field, target=target)
+    for deg in range(0, 360, 5):
+        a = math.radians(deg)
+        # Level, turning about Z: X and Y sweep the horizontal field.
+        cov.add(wp.Mag(horizontal * math.cos(a), horizontal * math.sin(a), -vertical, 25.0))
+        # Upright (X up), turning about X: Y and Z sweep the horizontal field.
+        cov.add(wp.Mag(vertical, horizontal * math.cos(a), horizontal * math.sin(a), 25.0))
+    return cov
+
+
+def test_dual_plane_target_is_reachable_with_the_documented_motion():
+    """
+    The two documented turns must be able to finish the dual-plane progress.
+
+    The geomagnetic field is inclined (about 37 deg in Taiwan), so an axis
+    that only moves in the horizontal plane sees about 80 % of the full swing.
+    """
+    sphere = cli.mag_coverage_target(wp.CalMode.MAG_SPHERE)
+    dual = cli.mag_coverage_target(wp.CalMode.MAG_DUAL_PLANE)
+    assert dual < sphere
+    assert not _coverage_after_dual_plane(sphere).complete()
+    assert _coverage_after_dual_plane(dual).complete()
+
+
+def test_dual_plane_instructions_explain_when_to_stop():
+    """The on-screen text says the bars may stop short and Enter is fine."""
+    text = '\n'.join(cli.DUAL_PLANE_STEPS)
+    assert 'Enter' in text
+    assert '鐵件' in text or '干擾' in text
+
+
+# ------------------------------------------------- guided verification (12, Enter)
+
+def _guided(clock, tmp_path, steps, color=False):
+    """Run the menu with (stream or None, answer) steps; a stream is set before answering."""
+    ser = FakeSerial(clock)
+    out = Output()
+    items = list(steps)
+
+    def inp(prompt=''):
+        out(prompt)
+        if not items:
+            raise EOFError
+        stream, answer = items.pop(0)
+        if stream is not None:
+            ser.stream = stream
+        return answer
+    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
+                      sleep_fn=clock.sleep, time_fn=clock.time, color=color)
+    return rc, out, ser
+
+
+def _level(yaw=0.0, roll=0.1, pitch=-0.2):
+    return _angle_frame(roll, pitch, yaw)
+
+
+GOOD_RUN = [
+    (None, '12'), (None, ''),          # open the menu entry, start guided verification
+    (_level(), ''),                    # 1 level
+    (_level(10.0), ''),                # 2 start direction
+    (_level(100.5), ''), (_level(-169.0), ''), (_level(-80.0), ''), (_level(11.0), ''),
+    (None, '0'),
+]
+
+
+def test_guided_verification_all_pass_without_height(clock, tmp_path):
+    rc, out, ser = _guided(clock, tmp_path, GOOD_RUN)
+    assert rc == 0
+    assert ser.writes == []                                   # read-only
+    assert '[合格] 1. 水平' in out.text
+    assert '[合格] 2. 每轉 90°' in out.text
+    assert '[合格] 3. 轉一圈回原位' in out.text
+    assert '[略過] 4. 高度' in out.text and '13' in out.text
+    assert '不合格' not in out.text
+    # Each of the four turns is reported with its measured change.
+    assert out.text.count('第 ') >= 4 and '+90.50°' in out.text
+
+
+def test_guided_verification_reports_failures(clock, tmp_path):
+    steps = [
+        (None, '12'), (None, ''),
+        (_level(roll=1.5), ''),                               # tilted: level fails
+        (_level(0.0), ''),
+        (_level(80.0), ''), (_level(-180.0), ''), (_level(-95.0), ''), (_level(8.0), ''),
+        (None, '0'),
+    ]
+    rc, out, _ = _guided(clock, tmp_path, steps)
+    assert '[不合格] 1. 水平' in out.text
+    assert '[不合格] 2. 每轉 90°' in out.text                  # 80, 100, 85, 103
+    assert '[不合格] 3. 轉一圈回原位' in out.text               # ends 8 deg off
+    assert '全部合格' not in out.text
+
+
+def test_guided_verification_height_step(clock, tmp_path):
+    def at(height_cm, yaw=0.0):
+        return _level(yaw) + _pressure_frame(101325, height_cm)
+    steps = [
+        (None, '12'), (None, ''),
+        (at(0), ''),
+        (None, 's'),                                          # skip the 90 deg turns
+        (None, 's'),                                          # skip the full turn
+        (at(0), ''), (at(95), ''),                            # height: +0.95 m
+        (None, '0'),
+    ]
+    rc, out, _ = _guided(clock, tmp_path, steps)
+    assert '[略過] 2. 每轉 90°' in out.text
+    assert '[略過] 3. 轉一圈回原位' in out.text
+    assert '[合格] 4. 高度' in out.text and '+0.95 m' in out.text
+
+
+def test_guided_verification_can_quit_early(clock, tmp_path):
+    steps = [(None, '12'), (None, ''), (_level(), ''), (None, 'q'), (None, '0')]
+    rc, out, _ = _guided(clock, tmp_path, steps)
+    assert rc == 0
+    assert '[合格] 1. 水平' in out.text
+    assert '已結束驗證' in out.text
+
+
+def test_guided_verification_without_data_does_not_pass(clock, tmp_path):
+    steps = [(None, '12'), (None, ''), (None, ''), (None, 'q'), (None, '0')]
+    rc, out, _ = _guided(clock, tmp_path, steps)
+    assert '[合格]' not in out.text
+    assert '未收到角度資料' in out.text
+
+
+def test_guided_verification_colours_pass_green_and_fail_red(clock, tmp_path):
+    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN, color=True)
+    assert '\033[32m[合格] 1. 水平' in out.text
+    steps = [(None, '12'), (None, ''), (_level(roll=2.0), ''), (None, 'q'), (None, '0')]
+    rc, out, _ = _guided(clock, tmp_path, steps, color=True)
+    assert '\033[31m[不合格] 1. 水平' in out.text
+
+
+def test_guided_verification_has_no_colour_codes_by_default(clock, tmp_path):
+    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
+    assert '\033[' not in out.text
+
+
+def test_guided_verification_serial_error_is_reported(clock, tmp_path):
+    class Broken(FakeSerial):
+
+        def read(self, size=1):
+            raise serial.SerialException('read failed')
+
+    ser = Broken(clock)
+    rc, out, _ = run(ser, ['12', '', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert 'read failed' in out.text
+    assert '[合格]' not in out.text
+
+
+def test_use_color_only_on_a_tty_without_no_color():
+    class Tty:
+        def isatty(self):
+            return True
+
+    class Pipe:
+        def isatty(self):
+            return False
+
+    assert cli.use_color(Tty(), {}) is True
+    assert cli.use_color(Pipe(), {}) is False
+    assert cli.use_color(Tty(), {'NO_COLOR': '1'}) is False
+
+
+# --------------------------------------------- in-place updates on a terminal
+
+def test_free_view_keeps_one_line_when_reference_is_set_on_a_terminal(clock, tmp_path):
+    """On a terminal Enter must not leave a 'reference set' line behind."""
+    ser = FakeSerial(clock, stream=_attitude_stream(yaw=30.0))
+    out = Output()
+    items = ['12', 'f', ('wait', 'yaw(Z)  +30.00°'), '', ('wait', 'Δyaw(Z)   +0.00°'), 'q', '0']
+
+    def inp(prompt=''):
+        while items and isinstance(items[0], tuple):
+            _wait_for(out, items.pop(0)[1])
+        if not items:
+            raise EOFError
+        return items.pop(0)
+    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
+                      sleep_fn=clock.sleep, time_fn=clock.time, color=True)
+    assert rc == 0
+    assert '參考點已設定' not in out.text
+    assert cli.CURSOR_UP_CLEAR in out.text          # the Enter newline is taken back
+
+
+def test_guided_verification_redraws_the_screen_on_a_terminal(clock, tmp_path):
+    """On a terminal each step clears the screen so old lines do not pile up."""
+    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN, color=True)
+    assert out.text.count(cli.CLEAR_SCREEN) >= 6
+    # After the last redraw only the final table remains: each result once.
+    tail = out.text.rsplit(cli.CLEAR_SCREEN, 1)[1]
+    assert tail.count('1. 水平') == 1
+    assert tail.count('2. 每轉 90°') == 1
+    assert '全部合格' not in tail or tail.count('全部合格') == 1
+
+
+def test_guided_verification_does_not_clear_the_screen_without_a_terminal(clock, tmp_path):
+    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
+    assert cli.CLEAR_SCREEN not in out.text

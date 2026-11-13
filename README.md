@@ -4,7 +4,7 @@ Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
 讀取 IMU、以 **Foxglove** 或 **RViz2** 可視化,並提供**硬體 + 軟體校正**工具。
 主機端只需要 Docker 與 Python 3.8 以上,所有操作都從互動選單 `python3 imu.py` 進行,不需要記指令參數。
 
-支援平台:**Linux**、**Windows 11 / WSL2**、**macOS**(Intel / Apple Silicon)。
+支援平台:**Linux**、**Windows 11 / WSL2**。
 
 ---
 
@@ -25,13 +25,12 @@ Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
 ## 架構概覽
 
 ```
-                         主機 (Linux / WSL2 / macOS)
+                         主機 (Linux / WSL2)
  ┌──────────┐  USB   ┌──────────────────────────────────────────────────────┐
- │ CMP10A   │──────▶│ /dev/ttyUSB0 (Linux/WSL)   /dev/cu.usbserial* (macOS) │
- │ (CP2102) │        │        │                         │                    │
- └──────────┘        │        │ --device                │ host/serial_tcp_   │
-                     │        │                         │ bridge.py          │
-                     │        ▼                         ▼ 127.0.0.1:5760     │
+ │ CMP10A   │──────▶│ /dev/usb_imu  (-> /dev/ttyUSB0)                       │
+ │ (CP2102) │        │        │                                              │
+ └──────────┘        │        │ --device                                     │
+                     │        ▼                                              │
                      │  ┌─────────── docker: yahboom-imu (ghcr.io 預建映像) ─┐│
                      │  │ wit_ros2_imu driver → /imu/data, /imu/mag, TF ...  ││
                      │  │ rosbridge :9090   foxglove_bridge :8765   RViz2    ││
@@ -45,9 +44,6 @@ Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
   建置並發佈到 GitHub Container Registry,支援 amd64 與 arm64。使用者一律下載這個預建映像,不在本機建置
 - 容器名:`yahboom-imu`(`--rm`,結束即刪除)
 - `./config` 掛載到容器 `/config`,軟體校正結果存在 `config/imu_calibration.yaml`
-- macOS 的 Docker Desktop 無法把 USB 序列埠傳進容器,因此由主機端
-  `host/serial_tcp_bridge.py` 把序列埠轉成 TCP,容器內以
-  `socket://host.docker.internal:5760` 連線(由 `imu.py` 自動啟動/停止)
 
 IMU 預設 9600 baud,約 10 Hz 輸出加速度、角速度、角度、磁力計封包。
 
@@ -92,22 +88,6 @@ IMU 預設 9600 baud,約 10 Hz 輸出加速度、角速度、角度、磁力計�
    `/tmp/.X11-unix`、`/mnt/wslg`、`DISPLAY`、`WAYLAND_DISPLAY`、
    `XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir`、`PULSE_SERVER`(變數存在才帶)。
 
-### macOS
-
-1. 安裝 Docker Desktop for Mac。
-2. 主機端 Python 需要 pyserial(`imu.py` 偵測到缺少時只會提示,不會自動安裝):
-   ```bash
-   python3 -m pip install pyserial==3.5
-   ```
-3. 若系統看不到 `/dev/cu.usbserial*` 或 `/dev/cu.SLAB_USBtoUART*`,安裝 Silicon Labs CP210x 驅動。
-   (CH340 類的板子會是 `/dev/cu.wchusbserial*`。)
-4. RViz2(選用):安裝 **XQuartz**,然後
-   - XQuartz → Preferences → Security → 勾選 **Allow connections from network clients**
-   - 重新啟動 XQuartz,在主機終端機執行 `xhost +localhost`
-   - 容器會以 `DISPLAY=host.docker.internal:0` 連到 XQuartz。
-
-   macOS 上 RViz2 走軟體繪圖(`LIBGL_ALWAYS_SOFTWARE=1`)較慢,**建議改用 Foxglove**。
-
 ---
 
 ## 使用流程:python3 imu.py
@@ -138,7 +118,7 @@ python3 imu.py
 | 4 校正工具 | `ros2 run wit_ros2_imu imu_calibrate --port <埠> --baud 9600 --config /config/imu_calibration.yaml`(見[校正流程](#校正流程)) |
 | 5 容器 shell | `bash`,ROS 環境已 source;有序列埠時一併傳入 |
 | 6 停止容器 | `docker stop yahboom-imu` |
-| 7 環境檢查 | 平台、docker daemon、映像是否已下載、容器狀態、序列埠與權限、DISPLAY、(macOS)pyserial |
+| 7 環境檢查 | 平台、docker daemon、映像是否已下載、容器狀態、序列埠與權限、DISPLAY |
 
 建議第一次使用:**7 環境檢查 → 1 下載映像 → 2 啟動 Foxglove**。
 
@@ -153,14 +133,12 @@ python3 imu.py
      `--device /dev/ttyUSB0:/dev/ttyUSB0` 傳入容器,容器內用同一路徑。
      若目前使用者沒有讀寫權限會中止並說明處理方式(用 `usb_udev_namer` 命名,或加入 dialout 群組)。
    - WSL 找不到裝置時會印出 `wsl_usb_auto` 與 `usb_udev_namer` 的步驟。
-   - macOS:`/dev/cu.usbserial*`、`/dev/cu.SLAB*`、`/dev/cu.wchusbserial*`;
-     容器啟動前在背景啟動序列埠橋接(log:`$TMPDIR/yahboom-imu-bridge.log`),容器結束後自動停止。
 3. 詢問**是否開放區網**(預設否):
    - 否:`-p 127.0.0.1:9090:9090 -p 127.0.0.1:8765:8765`,只有本機能連。
    - 是:`-p 9090:9090 -p 8765:8765`,區網其他電腦可連 `ws://<本機 IP>:8765`。
      **rosbridge / foxglove_bridge 沒有認證**,只在信任的網路開放。
 4. 若同名容器 `yahboom-imu` 正在執行,詢問是否先停止。
-5. 印出連線資訊,以前景執行容器;**按 Ctrl+C 結束**(會一併清理容器與橋接)。
+5. 印出連線資訊,以前景執行容器;**按 Ctrl+C 結束**(會一併清理容器)。
 
 注意:啟動需要互動式終端機(`docker run -it`),請直接在終端機執行,不要用管線餵輸入。
 環境檢查可以用管線測試:`printf '7\n0\n' | python3 imu.py`。
@@ -193,7 +171,6 @@ python3 imu.py
 
 - Linux:需要 X11 `DISPLAY`;若出現 `could not connect to display`,執行 `xhost +local:docker` 後重試。
 - WSL2:使用 WSLg,通常不需額外設定;`echo $DISPLAY` 應為 `:0`。
-- macOS:需 XQuartz 設定(見上方),畫面較慢,建議以 Foxglove 為主。
 
 ---
 
@@ -331,17 +308,23 @@ roll / pitch 主要由加速度計與陀螺儀決定,受影響較小。
 「工具顯示完成」或選項 8 讀到偏移值有變,只代表有寫進 IMU,**不代表校正得好**。
 IMU 不管有沒有校好都會顯示一個看起來合理的數字,所以要跟**已知的參考**比對才算數。
 
-選項 12 會即時顯示 roll(繞 X)、pitch(繞 Y)、yaw(繞 Z)與高度,只讀不寫:
+選項 12 只讀不寫,進入後有兩種模式:
+
+- **Enter:逐項驗證(建議)**。工具依序帶你做水平、每轉 90°(四次)、轉一圈回原位、高度四個步驟:
+  照畫面擺好後按 Enter,工具量測並判定,`[合格]` 以綠色、`[不合格]` 以紅色、`[略過]` 以黃色顯示,最後列出總表。
+  每一步可按 `s` 略過、`q` 結束。四次 90° 轉完即回到起點,第 3 步直接用它判定,不必再轉。
+  沒有氣壓資料時高度一步自動略過。輸出不是終端機或設了 `NO_COLOR` 時不上色。
+- **f:自由檢視**。即時顯示 roll(繞 X)、pitch(繞 Y)、yaw(繞 Z)與高度:
 
 ```
 roll(X)   +0.01°  pitch(Y)   -0.02°  yaw(Z) +111.71°  高度  -31.12 m
 ```
 
-- **Enter**:把目前姿態記成參考點,之後改顯示相對變化 Δ:
-  `Δroll(X)   -0.01°  Δpitch(Y)   +0.00°  Δyaw(Z)  +90.12°  Δ高度   +0.00 m`
-  每按一次 Enter 會更新參考點,並留下一行「參考點已設定」的紀錄。
-- **r**:清除參考點,回到顯示目前值。**q** 或 Ctrl+C:離開。
-- Δyaw 會自動處理 ±180° 換圈,例如從 170° 轉到 -170° 顯示 +20°。
+  - **Enter**:把目前姿態記成參考點,之後改顯示相對變化 Δ
+  - **r**:清除參考點;**q** 或 Ctrl+C:離開
+  - Δyaw 會自動處理 ±180° 換圈
+
+各項檢查與合格標準:
 
 | 檢查 | 怎麼做 | 合格(經驗值) | 檢查的是 |
 |---|---|---|---|
@@ -402,6 +385,8 @@ roll(X)   +0.01°  pitch(Y)   -0.02°  yaw(Z) +111.71°  高度  -31.12 m
   - **Y 不夠** → 繞 **X 或 Z** 軸轉
   - **Z 不夠** → 繞 **X 或 Y** 軸轉
 - 多轉幾圈沒關係,`[完成]` 只是代表「已經夠了」。
+- 選項 4 雙平面的轉法掃不滿每一軸的全部範圍(地磁是斜的,只在水平面上轉的那一軸約只掃到八成),
+  所以它的滿分門檻比選項 3 寬。某一軸仍停在九成左右時可直接按 Enter,再用選項 12 驗證。
 - 進度未滿就按 Enter 也會結束,但會提醒哪幾軸尚未涵蓋完整,建議之後重做。
 - 開始校正前,工具會先花約 2 秒量測目前的磁場強度,作為 100% 的基準。
 - 選項 10 是自動結束,門檻比 3 / 4 嚴格(要涵蓋約 95%),因為 hard-iron 偏移是用各軸最大、最小值的中點算的,兩端都要碰到才準。
@@ -478,25 +463,13 @@ sudo usermod -aG dialout "$USER"   # 然後重新登入(WSL:wsl --shutdown)
 - 若被 Windows 程式(例如 WitMotion 上位機)開著,先關閉它。
 - WSL 核心太舊時更新:PowerShell 執行 `wsl --update`。
 
-### macOS:RViz2 視窗打不開(XQuartz)
-
-- 確認 XQuartz → Preferences → Security → **Allow connections from network clients** 已勾選,並**重啟 XQuartz**。
-- 主機執行 `xhost +localhost`(每次 XQuartz 重啟後都要)。
-- 仍不行時改用 Foxglove(選項 2)。
-
-### macOS:找不到 pyserial / 橋接啟動失敗
-
-- `python3 -m pip install pyserial==3.5`(用同一個執行 `imu.py` 的 `python3`)。
-- 查看 log:`$TMPDIR/yahboom-imu-bridge.log`。
-- 5760 埠被佔用:`lsof -i :5760` 找出程式並結束。
-
 ### 埠被佔用(9090 / 8765)
 
 `docker run` 結束碼 125、訊息含 `address already in use`:
 
 ```bash
 docker ps                          # 是否有舊容器 → imu.py 選 6 停止
-sudo lsof -i :8765 -i :9090        # Linux / macOS
+sudo lsof -i :8765 -i :9090        # Linux
 ss -ltnp | grep -E '8765|9090'     # Linux / WSL
 ```
 
@@ -519,7 +492,7 @@ ss -ltnp | grep -E '8765|9090'     # Linux / WSL
 ## 開發與測試
 
 ```bash
-# 主機端腳本測試(imu.py、host/serial_tcp_bridge.py;需 pytest 與 pyserial==3.5)
+# 主機端腳本測試(需 pytest 與 pyserial==3.5)
 python3 -m pytest tests -q
 python3 -m flake8 imu.py host tests
 
@@ -538,18 +511,11 @@ docker run --rm ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy bash -c \
 
 ```
 imu.py                      # 主機端互動選單(stdlib only,Python >= 3.8)
-host/serial_tcp_bridge.py   # macOS 用 serial → TCP 雙向橋接(pyserial==3.5)
 tests/                      # 主機端腳本測試(pytest)
 docker/                     # Dockerfile、entrypoint.sh
 config/                     # 掛載到容器 /config(軟體校正 YAML)
 wit_ros2_imu/               # ROS 2 ament_python 套件(driver、協定、校正 CLI、launch、rviz)
 docs/SPEC.md                # 規格
-```
-
-橋接可單獨使用(只綁 127.0.0.1,一次服務一個 client,斷線後等待下一個;序列埠斷線會 log 並重試):
-
-```bash
-python3 host/serial_tcp_bridge.py --serial /dev/cu.usbserial-0001 --baud 9600 --port 5760
 ```
 
 授權:Apache-2.0。

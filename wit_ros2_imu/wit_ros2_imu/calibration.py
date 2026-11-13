@@ -111,6 +111,9 @@ def load_calibration(path: PathLike) -> SoftwareCalibration:
     return SoftwareCalibration(**values)
 
 
+CALIBRATION_FILE_MODE = 0o644   # offsets only, no secrets
+
+
 def save_calibration(path: PathLike, cal: SoftwareCalibration) -> None:
     """Validate ``cal`` and write it atomically to ``path`` as YAML."""
     cal = _validated(cal)
@@ -122,6 +125,9 @@ def save_calibration(path: PathLike, cal: SoftwareCalibration) -> None:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(text)
+        # mkstemp creates the file 0600; the tool runs as root in the
+        # container, so the host user could not read it through the mount.
+        os.chmod(tmp, CALIBRATION_FILE_MODE)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
