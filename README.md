@@ -40,8 +40,8 @@ Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
                      └──────────────────────────────────────────────────────┘
 ```
 
-- 映像:`ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy`,由 GitHub Actions 依 `docker/Dockerfile`(FROM `ros:jazzy-ros-base`)
-  建置並發佈到 GitHub Container Registry,支援 amd64 與 arm64。使用者一律下載這個預建映像,不在本機建置
+- 映像:`ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy`,由 GitHub Actions 預先建置(amd64、arm64),**只提供執行環境**。
+  程式碼 `wit_ros2_imu/` 在啟動時由 `imu.py` 掛載進容器,修改程式不需要重建映像
 - 容器名:`yahboom-imu`(`--rm`,結束即刪除)
 - `./config` 掛載到容器 `/config`,軟體校正結果存在 `config/imu_calibration.yaml`
 
@@ -505,11 +505,22 @@ docker run --rm ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy bash -c \
   'cd /ws && colcon test --packages-select wit_ros2_imu && colcon test-result --verbose'
 ```
 
-### Docker 映像的建置
+### 映像只提供環境,程式碼用掛載的
 
-映像由 `.github/workflows/docker-image.yml` 建置:`docker/`、`wit_ros2_imu/`、`.dockerignore` 或該 workflow 有變更並 push 到 `main` 時自動執行,
-也可在 GitHub 的 Actions 頁面手動觸發(Run workflow)。產出 `linux/amd64` 與 `linux/arm64` 兩種架構,
-標籤為 `jazzy`(最新)與 `sha-<commit>`。修改 driver 或 Dockerfile 後,須等 workflow 完成,再用 `imu.py` 選 1 重新下載。
+映像 `ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy` 只裝好 ROS 2 與相依套件。
+`imu.py` 啟動容器時,會把 repo 的 `wit_ros2_imu/` 以唯讀方式掛載到容器的 `/ws/src/wit_ros2_imu`;
+映像內的套件以 `colcon build --symlink-install` 安裝,實際執行的就是掛載進來的程式碼。
+
+| 改了什麼 | 要做什麼 |
+|---|---|
+| `wit_ros2_imu/` 裡的程式(driver、校正工具、launch) | 重新啟動 `imu.py` 的選項即可,不用重建映像 |
+| `imu.py`、教材、README | 不用做任何事 |
+| `docker/Dockerfile`、`package.xml`(相依套件)、`setup.py`(執行檔進入點、安裝的檔案) | push 到 `main`,GitHub Actions 自動重建;完成後選 1 重新下載 |
+
+使用者要更新工具,`git pull` 即可。
+
+映像由 `.github/workflows/docker-image.yml` 建置,產出 `linux/amd64` 與 `linux/arm64`,標籤為 `jazzy` 與 `sha-<commit>`;
+也可在 GitHub 的 Actions 頁面手動觸發(Run workflow)。
 
 目錄結構:
 

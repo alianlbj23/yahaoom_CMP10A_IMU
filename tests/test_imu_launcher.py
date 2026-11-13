@@ -238,6 +238,7 @@ def test_build_run_args_linux_foxglove():
         'docker', 'run', '--rm', '-it', '--name', 'yahboom-imu',
         '-p', '127.0.0.1:9090:9090', '-p', '127.0.0.1:8765:8765',
         '-v', '/repo/config:/config',
+        '-v', '/repo/wit_ros2_imu:/ws/src/wit_ros2_imu:ro',
         '--device', '/dev/ttyUSB0:/dev/ttyUSB0',
         'ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy',
         'ros2', 'launch', 'wit_ros2_imu', 'imu.launch.py',
@@ -715,3 +716,16 @@ def test_no_port_message_points_to_naming_tool():
     message = imu.no_port_message('linux')
     assert '/dev/usb_imu' in message
     assert 'usb_udev_namer' in message
+
+
+@pytest.mark.parametrize('mode', ['foxglove', 'rviz', 'calibrate', 'shell'])
+def test_build_run_args_mounts_the_source_read_only(mode):
+    """
+    The image only provides the environment; the code comes from the repo.
+
+    Every mode mounts wit_ros2_imu/ so that source edits take effect on the
+    next start without rebuilding the image.
+    """
+    args = imu.build_run_args('linux', '/dev/ttyUSB0', mode, False,
+                              '/repo', {})
+    assert _has_pair(args, '-v', '/repo/wit_ros2_imu:/ws/src/wit_ros2_imu:ro')

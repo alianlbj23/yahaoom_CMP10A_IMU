@@ -134,7 +134,8 @@ rosbridge_websocket port 9090、foxglove_bridge port 8765,皆 address 0.0.0.0(�
 - GUI:linux → DISPLAY + `/tmp/.X11-unix`;wsl → WSLg(`/tmp/.X11-unix`、`/mnt/wslg`、WAYLAND_DISPLAY、XDG_RUNTIME_DIR);
   mac → XQuartz `DISPLAY=host.docker.internal:0`(提示需開啟 network clients 與 `xhost +localhost`)
 - 埠對應預設綁 `127.0.0.1`(9090、8765);啟動時詢問是否開放區網(綁 0.0.0.0)
-- docker 指令用 `subprocess.run([...])` list 形式,不用 shell=True;`./config` 掛到 `/config`
+- docker 指令用 `subprocess.run([...])` list 形式,不用 shell=True;`./config` 掛到 `/config`;
+  `./wit_ros2_imu` 以唯讀掛到 `/ws/src/wit_ros2_imu`(映像以 `--symlink-install` 安裝,只提供環境,改程式不需重建映像)
 - 容器名 `yahboom-imu`
 
 ## 驗收

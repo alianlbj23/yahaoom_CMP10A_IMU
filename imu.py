@@ -45,6 +45,10 @@ FOXGLOVE_PORT = 8765
 BRIDGE_PORT = 5760
 BAUD = 9600
 CONTAINER_CONFIG = '/config'
+# The image only provides the environment: the ROS package is mounted from
+# the repository (read-only), so editing it never needs an image rebuild.
+SOURCE_DIR = 'wit_ros2_imu'
+CONTAINER_SOURCE = '/ws/src/wit_ros2_imu'
 CALIBRATION_FILE = CONTAINER_CONFIG + '/imu_calibration.yaml'
 MAC_SERIAL_URL = 'socket://host.docker.internal:%d' % BRIDGE_PORT
 
@@ -288,6 +292,8 @@ def build_run_args(platform: str, port: Optional[str], mode: str,
         args += publish_args(expose_lan)
     args += ['-v', '%s:%s' % (os.path.join(repo_dir, 'config'),
                               CONTAINER_CONFIG)]
+    args += ['-v', '%s:%s:ro' % (os.path.join(repo_dir, SOURCE_DIR),
+                                 CONTAINER_SOURCE)]
     inner_port = None
     if port:
         inner_port = container_port(platform, port)

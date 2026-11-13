@@ -33,7 +33,7 @@
 - CMP10A 模組、USB 線
 - 筆電(Linux 或 Windows + WSL2),已裝 Docker
 - 先執行 `python3 imu.py` 選 `1` 下載映像(約 2 GB)
-- 工具有更新時,**再選一次 `1` 重新下載**才會用到新版本
+- 工具有更新時,在 repo 資料夾執行 `git pull` 即可,不用重新下載映像
 - 水平儀(手機 app)、方形盒子、一塊小鐵片
 
 授課者另見 [instructor-notes.md](instructor-notes.md)。

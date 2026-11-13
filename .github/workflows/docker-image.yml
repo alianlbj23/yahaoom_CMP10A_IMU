@@ -1,5 +1,10 @@
 # Build the ROS 2 Jazzy image and publish it to GitHub Container Registry.
 # imu.py pulls ghcr.io/alianlbj23/yahaoom_cmp10a_imu:jazzy; nobody builds locally.
+#
+# The image only provides the environment. imu.py mounts wit_ros2_imu/ from the
+# repository, so ordinary source edits do not need a rebuild. A rebuild is only
+# needed when the environment or the package layout changes: the Dockerfile,
+# dependencies (package.xml) or entry points / installed files (setup.py).
 name: docker-image
 
 on:
@@ -7,7 +12,9 @@ on:
     branches: [main]
     paths:
       - docker/**
-      - wit_ros2_imu/**
+      - wit_ros2_imu/package.xml
+      - wit_ros2_imu/setup.py
+      - wit_ros2_imu/setup.cfg
       - .dockerignore
       - .github/workflows/docker-image.yml
   workflow_dispatch:
