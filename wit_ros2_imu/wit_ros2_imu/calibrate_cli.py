@@ -139,8 +139,19 @@ MAG_MIN_SAMPLES = 50
 DIP_MIN_PAIRS = 20
 NOAA_CALCULATOR = 'https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml'
 CHECK_ITEMS = ('accel', 'gyro_still', 'gyro_turn', 'mag_norm', 'mag_dip')
-PASS, FAIL, SKIP = '合格', '不合格', '略過'
-ANSI_COLOURS = {PASS: '\033[32m', FAIL: '\033[31m', SKIP: '\033[33m'}
+CHECK_TITLE = '== 校正檢測 =='
+# Environment / mounting check before a magnetometer calibration.
+ENV_STILL_S = 5.0
+SLIDE_DISTANCE_CM = 30
+MOTOR_BASE_S = 3.0
+MOTOR_RUN_S = 5.0
+PRECHECK_INTRO = [
+    '校正前先用 IMU 自己的讀數檢查環境與安裝位置(約 1 分鐘):',
+    '  地磁在一個房間內處處相同、不隨時間改變;讀數若會變動或跟著位置改變,就是周圍有干擾。',
+    '標準與理由見 docs/CALIBRATION_CHECK.md。',
+]
+PASS, FAIL, SKIP, NOTE = '合格', '不合格', '略過', '注意'
+ANSI_COLOURS = {PASS: '\033[32m', FAIL: '\033[31m', SKIP: '\033[33m', NOTE: '\033[33m'}
 ANSI_RESET = '\033[0m'
 CHECK_INTRO = [
     '每一項都拿「IMU 以外的已知參考」比對原始讀數,不使用模組自己算的角度:',
@@ -238,6 +249,7 @@ class CalibrationMenu:
         self._time = time_fn
         self._unlock_time: Optional[float] = None
         self._verify_lines: List[str] = []
+        self._verify_title = CHECK_TITLE
         self._check_cal = SoftwareCalibration()
         self._check_passed: set = set()   # check items passed in this run
         self._expected_dip: Optional[float] = None
@@ -470,6 +482,8 @@ class CalibrationMenu:
 
     def hw_mag(self, mode: wp.CalMode, title: str) -> None:
         """Hardware magnetometer calibration (sphere fit or dual plane)."""
+        if not self._mag_precheck():
+            return
         if mode == wp.CalMode.MAG_DUAL_PLANE:
             steps = list(DUAL_PLANE_STEPS)
         else:
@@ -557,6 +571,8 @@ class CalibrationMenu:
 
     def sw_mag(self) -> None:
         """Software magnetometer hard-iron calibration written to YAML."""
+        if not self._mag_precheck():
+            return
         self._out('== 軟體磁力計 hard-iron 校正 ==')
         self._out('按 Enter 後開始取樣,期間請將 IMU 繞三軸緩慢轉動(遠離金屬與磁鐵)。')
         for line in MAG_PROGRESS_HELP[:2]:
@@ -601,8 +617,12 @@ class CalibrationMenu:
         choices = {'': ('accel', 'gyro_still', 'gyro_turn', 'mag'), '1': ('accel',),
                    '2': ('gyro_still',), '3': ('gyro_turn',), '4': ('mag',)}
         cmd = self._ask('Enter = 完整檢測(約 10 分鐘)  1 加速度計  2 陀螺儀靜止(5 分鐘)  '
-                        '3 陀螺儀轉一圈  4 磁力計  f = 姿態檢視  q = 返回:').lower()
+                        '3 陀螺儀轉一圈  4 磁力計  5 環境 / 安裝位置  f = 姿態檢視  '
+                        'q = 返回:').lower()
         if cmd == 'q':
+            return
+        if cmd == '5':
+            self._mag_precheck(report_only=True)
             return
         if cmd == 'f':
             self._attitude_free_view()
@@ -620,11 +640,11 @@ class CalibrationMenu:
             return f'{ANSI_COLOURS[status]}{line}{ANSI_RESET}'
         return line
 
-    def _verify_redraw(self, title: str = '== 校正檢測 ==') -> None:
+    def _verify_redraw(self) -> None:
         """On a terminal, clear the screen and show only what is still relevant."""
         if not self._color:
             return
-        self._out(CLEAR_SCREEN + title)
+        self._out(CLEAR_SCREEN + self._verify_title)
         for line in self._verify_lines:
             self._out(line)
 
@@ -951,12 +971,234 @@ class CalibrationMenu:
             if ok:
                 self._check_passed.add('mag_dip')
 
+    # -------------------------------------- environment / mounting precheck
+
+    def _record_still(self, prompt: str, seconds: float, need_still: bool = True):
+        """
+        Record ``seconds`` of magnetometer and accelerometer data.
+
+        With ``need_still`` the recording starts once the IMU has been still for
+        STILL_HOLD_S and restarts if it moves.  Return a dict with 'mags' and
+        'accels', or None when skipped.
+        """
+        st = {'gyro': None, 'hold': None, 'start': None, 'mags': [], 'accels': []}
+
+        def reset():
+            st['hold'] = st['start'] = None
+            st['mags'] = []
+            st['accels'] = []
+
+        def on_packet(p, now):
+            if isinstance(p, wp.Gyro):
+                st['gyro'] = p
+                if need_still and not self._still(p):
+                    reset()
+                return
+            if st['start'] is None:
+                if need_still and not self._still(st['gyro']):
+                    return
+                if st['hold'] is None:
+                    st['hold'] = now
+                if not need_still or now - st['hold'] >= STILL_HOLD_S:
+                    st['start'] = now
+            if st['start'] is None:
+                return
+            if isinstance(p, wp.Mag):
+                st['mags'].append((p.x, p.y, p.z))
+            elif isinstance(p, wp.Accel):
+                st['accels'].append((p.x, p.y, p.z))
+
+        def done(now):
+            return (st['start'] is not None and now - st['start'] >= seconds
+                    and len(st['mags']) >= 3 and len(st['accels']) >= 3)
+
+        def status(now):
+            if st['start'] is None:
+                return '等待靜止...'
+            bar = progress_bar((now - st['start']) / seconds, 10)
+            return f'記錄中 {bar}  {len(st["mags"])} 筆'
+
+        while True:
+            cmd = self._watch(prompt, status, on_packet, done)
+            if cmd is None:
+                return st
+            if cmd == 's':
+                return None
+            self._out('這一步會自動記錄,不用按 Enter。')
+
+    def _precheck_still(self, results, hints) -> Optional[Tuple[float, float, float]]:
+        """Return the mean acceleration at rest (for the mounting tilt), or None."""
+        name = '1. 磁場穩定'
+        data = self._record_still(
+            f'環境 1/2 靜止:IMU 放在要校正的位置,放著不動,自動記錄 {ENV_STILL_S:.0f} 秒'
+            '(s 略過 / q 結束):', ENV_STILL_S)
+        if data is None:
+            self._record(results, SKIP, name)
+            return None
+        noise = cc.field_noise(data['mags'])
+        ok = cc.noise_ok(noise)
+        self._record(results, PASS if ok else FAIL,
+                     f'{name}:靜止時磁場變動 {noise:.1%}(標準 {cc.ENV_NOISE_TOL:.0%} 內)')
+        if not ok:
+            hints.append('磁場在變動:附近有馬達在轉、電流在變,或有人拿著金屬、手機經過。'
+                         '關掉附近的電器、請旁人離開再試。')
+        n = float(len(data['accels']))
+        return tuple(sum(a[i] for a in data['accels']) / n for i in range(3))
+
+    def _precheck_slide(self, results, hints) -> None:
+        name = '2. 附近有無鐵件'
+        while True:
+            cmd = self._watch('環境 2/2 平移:IMU(或整台車)擺在起點,按 Enter 開始'
+                              '(s 略過 / q 結束):', lambda now: '準備好後按 Enter')
+            if cmd == 's':
+                self._record(results, SKIP, name)
+                return
+            if cmd != '':
+                continue
+            meter = cc.RotationMeter()
+            st = {'ref': [], 'mags': []}
+
+            def on_packet(p, now):
+                if isinstance(p, wp.Gyro):
+                    meter.add(now, (p.x, p.y, p.z))
+                elif isinstance(p, wp.Mag):
+                    vec = (p.x, p.y, p.z)
+                    if len(st['ref']) < 3:
+                        st['ref'].append(vec)
+                    st['mags'].append(vec)
+
+            def status(now):
+                change = (f'{cc.field_change(st["ref"], st["mags"]):.1%}'
+                          if len(st['ref']) >= 3 else '--')
+                warn = '  轉動了,請保持方向不變' if not cc.slide_valid(meter.total_deg) else ''
+                return f'磁場變化 {change}  已轉動 {meter.total_deg:.1f}°{warn}'
+
+            cmd = self._watch(f'  不要轉動,沿桌面或地面平移約 {SLIDE_DISTANCE_CM} cm,停住後按 Enter'
+                              '(s 略過 / q 結束):', status, on_packet)
+            if cmd == 's':
+                self._record(results, SKIP, name)
+                return
+            if len(st['ref']) < 3 or len(st['mags']) < 5:
+                self._verify_note('  資料不足,請再做一次(平移時間久一點)。')
+                continue
+            if not cc.slide_valid(meter.total_deg):
+                self._verify_note(f'  平移時轉了 {meter.total_deg:.1f}°'
+                                  f'(要在 {cc.SLIDE_MAX_ROTATION_DEG:.0f}° 內),這次不算,請再做一次。')
+                continue
+            change = cc.field_change(st['ref'], st['mags'])
+            ok = cc.change_ok(change)
+            self._record(results, PASS if ok else FAIL,
+                         f'{name}:平移時磁場變化 {change:.1%}(標準 {cc.ENV_CHANGE_TOL:.0%} 內)')
+            if not ok:
+                hints.append('平移時磁場跟著位置改變:附近有鐵件(鐵桌、鐵櫃、筆電、含鋼筋的地板)。'
+                             '換到木桌或空曠處,或把 IMU 墊高遠離地面。')
+            return
+
+    def _precheck_mounting(self, results, hints, accel_mean) -> None:
+        if accel_mean is not None:
+            tilt = cc.tilt_deg(accel_mean)
+            name = '3. 安裝方向'
+            if tilt <= cc.TILT_NOTE_DEG:
+                self._record(results, PASS, f'{name}:元件面朝上,傾斜 {tilt:.1f}°')
+            elif tilt < 45.0:
+                self._record(results, NOTE, f'{name}:傾斜 {tilt:.1f}°。小角度可用選項 6 修正,'
+                             '或在 ROS 的 TF 設定安裝角度')
+            else:
+                self._record(results, NOTE, f'{name}:元件面沒有朝上(偏 {tilt:.0f}°),'
+                             'ROS 的 TF 要設定安裝角度')
+        names = ('4. 馬達干擾', '5. 振動')
+        base = self._record_still(
+            f'安裝 1/2:車子通電,把車架高讓輪子懸空,馬達先不要轉。自動記錄 {MOTOR_BASE_S:.0f} 秒'
+            '(s 略過 / q 結束):', MOTOR_BASE_S)
+        cmd = None if base is None else self._watch(
+            '安裝 2/2:讓馬達以平常的速度轉起來,轉穩後按 Enter(s 略過 / q 結束):',
+            lambda now: '馬達轉穩後按 Enter')
+        running = None if base is None or cmd == 's' else self._record_still(
+            f'  量測中,馬達保持轉動,自動記錄 {MOTOR_RUN_S:.0f} 秒(s 略過 / q 結束):',
+            MOTOR_RUN_S, need_still=False)
+        if running is None:
+            for name in names:
+                self._record(results, SKIP, name)
+            return
+        change = cc.field_change(base['mags'], running['mags'])
+        ok = cc.change_ok(change)
+        self._record(results, PASS if ok else FAIL,
+                     f'{names[0]}:馬達轉動時磁場變化 {change:.1%}(標準 {cc.ENV_CHANGE_TOL:.0%} 內)')
+        if not ok:
+            hints.append('馬達運轉時磁場改變:IMU 離馬達或電源線太近。'
+                         '移遠一點(至少 10 cm,越遠越好)或墊高。這會讓 yaw 不準。')
+        vib = cc.vibration(running['accels'])
+        ok = cc.vibration_ok(vib)
+        self._record(results, PASS if ok else FAIL,
+                     f'{names[1]}:馬達轉動時 {vib:.2f} m/s²(標準 {cc.VIBRATION_TOL} 內)')
+        if not ok:
+            hints.append('振動大:IMU 沒有鎖緊,或太靠近馬達。鎖緊固定、靠近車體中心,'
+                         '必要時加一層薄的減震墊。')
+
+    def _mag_precheck(self, report_only: bool = False) -> bool:
+        """
+        Check the surroundings and the mounting position from the IMU's own readings.
+
+        Return True to go on with the magnetometer calibration.  When something
+        is unsuitable the user is told why and asked twice before going on.
+        """
+        if self._key_ready is None:
+            self._out('(環境與安裝位置檢查需要在終端機中執行,已略過)')
+            return True
+        self._verify_title = '== 校正前檢查:環境與安裝位置 =='
+        self._verify_lines = []
+        for line in PRECHECK_INTRO:
+            self._verify_note(line)
+        results: List[Tuple[str, str]] = []
+        hints: List[str] = []
+        try:
+            accel_mean = self._precheck_still(results, hints)
+            self._precheck_slide(results, hints)
+            if self._confirm('IMU 已經裝在車上的最終位置了嗎?'):
+                self._precheck_mounting(results, hints, accel_mean)
+            else:
+                self._verify_note('IMU 還沒裝上車:裝上去之後,要在最終位置重新檢查與校正。')
+        except _VerifyQuit:
+            self._out('已結束檢查。')
+            if report_only:
+                return True
+            self._out('已取消校正,未送出任何指令。')
+            return False
+        except (serial.SerialException, OSError) as exc:
+            logger.error('reading IMU data in the environment check failed: %s', exc)
+            self._out(f'讀取 IMU 資料失敗:{exc}')
+            return report_only
+        finally:
+            self._verify_title = CHECK_TITLE
+        self._out((CLEAR_SCREEN if self._color else '') + '== 環境與安裝位置 檢查結果 ==')
+        for status, text in results:
+            self._out(self._mark(status, text))
+        if not any(status == FAIL for status, _ in results):
+            if any(status == PASS for status, _ in results):
+                self._out(self._mark(PASS, '環境與安裝位置合適'))
+            return True
+        self._out('不適合的原因與改善方式:')
+        for hint in hints:
+            self._out(f'  - {hint}')
+        if report_only:
+            return True
+        if not self._confirm('目前的環境或安裝位置不適合。仍要在這裡繼續校正嗎?'):
+            self._out('已取消校正,未送出任何指令。')
+            return False
+        if not self._confirm('再確認一次:在不適合的環境或位置校正,結果會不準,'
+                             '裝上車後也可能不穩定。確定繼續?'):
+            self._out('已取消校正,未送出任何指令。')
+            return False
+        self._out('依你的選擇,繼續校正。')
+        return True
+
     def calibration_check(self, items=('accel', 'gyro_still', 'gyro_turn', 'mag')) -> None:
         """Run the reference-based checks; read-only."""
         if self._key_ready is None:
             self._out('校正檢測需要在終端機中執行(python3 imu.py → 4 IMU 校正工具)。')
             return
         self._verify_lines = []
+        self._verify_title = CHECK_TITLE
         self._check_cal = self._load_existing()
         for line in CHECK_INTRO:
             self._verify_note(line)

@@ -166,3 +166,53 @@ def test_parse_dip_accepts_degrees(text, value):
 def test_parse_dip_rejects_bad_values(text):
     with pytest.raises(ValueError):
         cc.parse_dip(text)
+
+
+# ---------------------------------------- environment and mounting position
+
+def test_field_noise_is_small_when_the_field_is_steady():
+    mags = [(4000.0 + (i % 3) * 10.0, 0.0, 0.0) for i in range(50)]   # +-10 LSB jitter
+    assert cc.field_noise(mags) < 0.005
+    assert cc.noise_ok(cc.field_noise(mags))
+
+
+def test_field_noise_sees_a_changing_field():
+    mags = [(4000.0 + (300.0 if i % 2 else 0.0), 0.0, 0.0) for i in range(50)]
+    assert not cc.noise_ok(cc.field_noise(mags))
+
+
+def test_field_change_compares_against_the_reference_position():
+    ref = [(4000.0, 0.0, 0.0)] * 5
+    same = [(4010.0, 5.0, -5.0)] * 40
+    near_iron = [(4000.0, 0.0, 0.0)] * 20 + [(4000.0, 700.0, 0.0)] * 20
+    assert cc.change_ok(cc.field_change(ref, same))
+    assert not cc.change_ok(cc.field_change(ref, near_iron))
+
+
+def test_field_change_needs_data():
+    with pytest.raises(ValueError):
+        cc.field_change([], [(1.0, 0.0, 0.0)])
+
+
+def test_rotation_meter_adds_up_turning_on_any_axis():
+    meter = cc.RotationMeter()
+    for i in range(11):                       # 10 deg/s about Y for 1 s
+        meter.add(i * 0.1, (0.0, math.radians(10.0), 0.0))
+    assert meter.total_deg == pytest.approx(10.0)
+    assert not cc.slide_valid(meter.total_deg)
+    assert cc.slide_valid(1.0)
+
+
+def test_tilt_from_z_up():
+    assert cc.tilt_deg((0.0, 0.0, G)) == pytest.approx(0.0)
+    assert cc.tilt_deg((G * math.sin(math.radians(8)), 0.0, G * math.cos(math.radians(8)))) \
+        == pytest.approx(8.0)
+    assert cc.tilt_deg((0.0, 0.0, -G)) == pytest.approx(180.0)
+
+
+def test_vibration_is_the_spread_of_the_acceleration():
+    calm = [(0.0, 0.0, G)] * 20
+    shaking = [(0.0, 0.0, G + (2.0 if i % 2 else -2.0)) for i in range(20)]
+    assert cc.vibration(calm) == pytest.approx(0.0)
+    assert cc.vibration(shaking) == pytest.approx(2.0)
+    assert not cc.vibration_ok(cc.vibration(shaking))

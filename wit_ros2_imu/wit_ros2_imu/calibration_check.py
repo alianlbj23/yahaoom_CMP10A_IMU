@@ -241,3 +241,104 @@ def parse_dip(text: str) -> float:
     if not math.isfinite(value) or not -90.0 <= value <= 90.0:
         raise ValueError(f'inclination must be between -90 and 90 degrees, got {text!r}')
     return value
+
+
+# ----------------------------------------- environment and mounting position
+#
+# Checked before a magnetometer calibration.  The Earth's field is the same
+# everywhere in a room and does not change over seconds, so a field that moves
+# while the IMU is still, changes when the IMU is slid without turning, or
+# changes when the motors run, comes from the surroundings.
+
+ENV_NOISE_TOL = 0.01         # std of |B| at rest / mean |B|          (sensor noise ~0.5 %)
+ENV_CHANGE_TOL = 0.05        # field change / |B| when slid or with motors running (~3 deg)
+SLIDE_MAX_ROTATION_DEG = 3.0  # more turning than this makes the slide test invalid
+TILT_NOTE_DEG = 5.0          # mounted tilt above this is reported
+VIBRATION_TOL = 1.0          # m/s^2, std of |a| with the motors running (~0.1 g)
+
+
+def field_noise(mags: Sequence[Sequence[float]]) -> float:
+    """Return the standard deviation of |B| divided by its mean."""
+    norms = [_norm(m) for m in mags]
+    if len(norms) < 2:
+        raise ValueError('not enough samples')
+    mean = sum(norms) / len(norms)
+    if mean <= 0:
+        raise ValueError('magnetometer reads zero')
+    var = sum((n - mean) ** 2 for n in norms) / (len(norms) - 1)
+    return math.sqrt(var) / mean
+
+
+def noise_ok(noise: float) -> bool:
+    """Return True if the field at rest is steady."""
+    return noise <= ENV_NOISE_TOL
+
+
+def field_change(reference: Sequence[Sequence[float]],
+                 mags: Sequence[Sequence[float]]) -> float:
+    """
+    Return how far the field moved away from the reference, as a fraction of it.
+
+    The vector difference is used, so a change of direction counts as well as
+    a change of strength.  MAG_SPREAD_SHARE of the samples decide, so one spike
+    does not.
+    """
+    ref = _mean3(reference)
+    ref_norm = _norm(ref)
+    if ref_norm <= 0 or not mags:
+        raise ValueError('not enough samples')
+    deviations = sorted(_norm([a - b for a, b in zip(m, ref)]) for m in mags)
+    k = max(0, math.ceil(MAG_SPREAD_SHARE * len(deviations)) - 1)
+    return deviations[k] / ref_norm
+
+
+def change_ok(change: float) -> bool:
+    """Return True if the field stayed within ENV_CHANGE_TOL."""
+    return change <= ENV_CHANGE_TOL
+
+
+class RotationMeter:
+    """Add up how much the IMU turned, about any axis, from gyro samples (rad/s)."""
+
+    def __init__(self):
+        """Start at zero."""
+        self.total_deg = 0.0
+        self._last = None
+
+    def add(self, t: float, rate_xyz: Sequence[float]) -> float:
+        """Add one sample taken at time ``t``; return the total in degrees."""
+        rate = _norm(rate_xyz)
+        if self._last is not None:
+            t0, r0 = self._last
+            dt = t - t0
+            if 0.0 < dt <= MAX_GAP_S:
+                self.total_deg += math.degrees((r0 + rate) / 2.0 * dt)
+        self._last = (t, rate)
+        return self.total_deg
+
+
+def slide_valid(rotation_deg: float) -> bool:
+    """Return True if the IMU was slid without turning noticeably."""
+    return rotation_deg <= SLIDE_MAX_ROTATION_DEG
+
+
+def tilt_deg(accel: Sequence[float]) -> float:
+    """Return the angle between the IMU's +Z axis and straight up, in degrees."""
+    n = _norm(accel)
+    if n <= 0:
+        raise ValueError('zero vector')
+    return math.degrees(math.acos(max(-1.0, min(1.0, accel[2] / n))))
+
+
+def vibration(accels: Sequence[Sequence[float]]) -> float:
+    """Return the standard deviation of |a| in m/s^2."""
+    norms = [_norm(a) for a in accels]
+    if not norms:
+        raise ValueError('no samples')
+    mean = sum(norms) / len(norms)
+    return math.sqrt(sum((n - mean) ** 2 for n in norms) / len(norms))
+
+
+def vibration_ok(value: float) -> bool:
+    """Return True if the vibration with the motors running is acceptable."""
+    return value <= VIBRATION_TOL

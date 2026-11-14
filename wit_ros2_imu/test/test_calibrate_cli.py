@@ -1132,14 +1132,15 @@ class _Check:
     """
 
     def __init__(self, clock, tmp_path, steps, entry='', max_reads=60000,
-                 config=None):
+                 config=None, menu=None):
         self.clock = clock
         self.ser = FakeSerial(clock)
         self.steps = list(steps)
         self.key = None
         self.due = 0.0
-        self.menu = ['12', entry]
+        self.menu = list(menu) if menu is not None else ['12', entry]
         self.lines = []
+        self.prompts = []
         self.reads = 0
         real_read = self.ser.read
 
@@ -1168,6 +1169,7 @@ class _Check:
             self._next_step()
 
     def _input(self, prompt=''):
+        self.prompts.append(prompt)
         if '磁傾角' in prompt and self.steps:
             self._next_step()
         if self.key is not None:
@@ -1303,3 +1305,113 @@ def test_check_needs_a_terminal(clock, tmp_path):
     rc, out, _ = run(ser, ['12', '', '0'], clock, tmp_path)
     assert '需要在終端機中執行' in out.text
     assert ser.writes == []
+
+
+# ------------------------ environment / mounting check before a mag calibration
+
+def _env_stream(mag=(4000, 0, 0), accel=(0.0, 0.0, G0), gyro=STILL):
+    return gyro + _acc_frame(*accel) + _mag_frame(*mag)
+
+
+STEADY = _env_stream()
+NOISY = _env_stream() + _env_stream(mag=(4300, 0, 0))            # field jumps 7 %
+NEAR_IRON = _env_stream() + _env_stream(mag=(4000, 700, 0))      # changes with position
+MOTORS = (_env_stream(mag=(4000, 600, 0), accel=(0.0, 0.0, G0 + 2.0))
+          + _env_stream(mag=(4000, -600, 0), accel=(0.0, 0.0, G0 - 2.0)))
+
+
+def _env_steps(still=STEADY, slide=STEADY):
+    return [(still, None, 0), (STEADY, '', 0), (slide, '', 2.0)]
+
+
+MAG_SPHERE_CMD = wp.cmd_calsw(wp.CalMode.MAG_SPHERE)
+
+
+def test_mag_calibration_checks_the_environment_first(clock, tmp_path):
+    """A good place passes in green and the calibration goes on as before."""
+    run = _Check(clock, tmp_path, _env_steps(), menu=['3', 'n', 'y', ''])
+    assert '[合格] 1. 磁場穩定' in run.text
+    assert '[合格] 2. 附近有無鐵件' in run.text
+    assert '\033[32m[合格] 環境與安裝位置合適' in run.text
+    assert not any('仍要在這裡繼續校正' in p for p in run.prompts)
+    assert MAG_SPHERE_CMD in run.ser.writes
+
+
+def test_unsuitable_place_is_explained_and_can_be_cancelled(clock, tmp_path):
+    run = _Check(clock, tmp_path, _env_steps(still=NOISY), menu=['3', 'n', 'n'])
+    assert '[不合格] 1. 磁場穩定' in run.text
+    assert '附近有馬達在轉' in run.text
+    assert '已取消校正,未送出任何指令' in run.text
+    assert run.ser.writes == []
+
+
+def test_unsuitable_place_asks_a_second_time(clock, tmp_path):
+    """Saying yes once is not enough: the second question can still cancel."""
+    run = _Check(clock, tmp_path, _env_steps(slide=NEAR_IRON), menu=['3', 'n', 'y', 'n'])
+    assert '[不合格] 2. 附近有無鐵件' in run.text
+    assert any('仍要在這裡繼續校正' in p for p in run.prompts)
+    assert any('再確認一次' in p for p in run.prompts)
+    assert '已取消校正' in run.text
+    assert run.ser.writes == []
+
+
+def test_user_who_insists_twice_gets_the_calibration(clock, tmp_path):
+    run = _Check(clock, tmp_path, _env_steps(slide=NEAR_IRON),
+                 menu=['3', 'n', 'y', 'y', 'y', ''])
+    assert '依你的選擇,繼續校正' in run.text
+    assert MAG_SPHERE_CMD in run.ser.writes
+
+
+def test_slide_that_turns_is_not_counted(clock, tmp_path):
+    turning = _env_stream(gyro=_gyro_frame(0, 0, 10.0))
+    steps = [(STEADY, None, 0), (STEADY, '', 0), (turning, '', 2.0), (None, 's', 0)]
+    run = _Check(clock, tmp_path, steps, menu=['3', 'n', 'n'])
+    assert '這次不算' in run.text
+    assert '[略過] 2. 附近有無鐵件' in run.text
+
+
+def test_mounting_position_near_motors_is_reported(clock, tmp_path):
+    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 0), (MOTORS, None, 0)]
+    run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'n'])
+    assert '[合格] 3. 安裝方向' in run.text
+    assert '[不合格] 4. 馬達干擾' in run.text
+    assert '[不合格] 5. 振動' in run.text
+    assert '離馬達或電源線太近' in run.text
+    assert run.ser.writes == []
+
+
+def test_tilted_mounting_is_a_note_not_a_failure(clock, tmp_path):
+    tilted = _env_stream(accel=(G0 * math.sin(math.radians(10)), 0.0,
+                                G0 * math.cos(math.radians(10))))
+    steps = [(tilted, None, 0), (tilted, '', 0), (tilted, '', 2.0),
+             (STEADY, None, 0), (STEADY, '', 0), (STEADY, None, 0)]
+    run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'y', ''])
+    assert '[注意] 3. 安裝方向:傾斜 10.0°' in run.text
+    assert '環境與安裝位置合適' in run.text
+    assert MAG_SPHERE_CMD in run.ser.writes
+
+
+def test_software_mag_calibration_is_checked_too(clock, tmp_path):
+    run = _Check(clock, tmp_path, _env_steps(still=NOISY), menu=['10', 'n', 'n'])
+    assert '[不合格] 1. 磁場穩定' in run.text
+    assert '已取消校正' in run.text
+    assert not (tmp_path / 'c.yaml').exists()
+
+
+def test_option_12_can_check_the_place_without_calibrating(clock, tmp_path):
+    run = _Check(clock, tmp_path, _env_steps(slide=NEAR_IRON), menu=['12', '5', 'n'])
+    assert '[不合格] 2. 附近有無鐵件' in run.text
+    assert not any('仍要在這裡繼續校正' in p for p in run.prompts)
+    assert run.ser.writes == []
+
+
+def test_quitting_the_check_cancels_the_calibration(clock, tmp_path):
+    run = _Check(clock, tmp_path, [(STEADY, 'q', 0.5)], menu=['3'])
+    assert '已取消校正' in run.text
+    assert run.ser.writes == []
+
+
+def test_environment_check_is_skipped_off_a_terminal(clock, tmp_path):
+    ser = FakeSerial(clock)
+    rc, out, _ = run(ser, ['3', 'n', '0'], clock, tmp_path)
+    assert '環境與安裝位置檢查需要在終端機中執行' in out.text
