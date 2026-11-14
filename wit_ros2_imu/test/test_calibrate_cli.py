@@ -21,6 +21,7 @@ import pytest
 import serial
 from wit_ros2_imu import calibrate_cli as cli
 from wit_ros2_imu import calibration as cal
+from wit_ros2_imu import calibration_check as cc
 from wit_ros2_imu import wit_protocol as wp
 import yaml
 
@@ -854,10 +855,12 @@ def test_attitude_view_reference_needs_data(clock, tmp_path):
     assert '尚未收到角度資料' in out.text
 
 
-def test_attitude_view_explains_how_to_verify(clock, tmp_path):
+def test_option_12_offers_the_calibration_check(clock, tmp_path):
+    """The entry prompt offers the full check, single checks and the free view."""
     ser = FakeSerial(clock)
-    rc, out = _run_with_watcher(ser, clock, tmp_path, ['12', 'f', 'q', '0'])
-    assert '90°' in out.text and '轉一圈' in out.text
+    rc, out, inp = run(ser, ['12', 'q', '0'], clock, tmp_path)
+    prompt = ' '.join(inp.prompts)
+    assert '完整檢測' in prompt and '1 加速度計' in prompt and 'f = 姿態檢視' in prompt
 
 
 def test_attitude_view_ctrl_c_returns_to_menu(clock, tmp_path):
@@ -972,126 +975,6 @@ def test_dual_plane_instructions_explain_when_to_stop():
     assert '鐵件' in text or '干擾' in text
 
 
-# ------------------------------------------------- guided verification (12, Enter)
-
-def _guided(clock, tmp_path, steps, color=False):
-    """Run the menu with (stream or None, answer) steps; a stream is set before answering."""
-    ser = FakeSerial(clock)
-    out = Output()
-    items = list(steps)
-
-    def inp(prompt=''):
-        out(prompt)
-        if not items:
-            raise EOFError
-        stream, answer = items.pop(0)
-        if stream is not None:
-            ser.stream = stream
-        return answer
-    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
-                      sleep_fn=clock.sleep, time_fn=clock.time, color=color)
-    return rc, out, ser
-
-
-def _level(yaw=0.0, roll=0.1, pitch=-0.2):
-    return _angle_frame(roll, pitch, yaw)
-
-
-GOOD_RUN = [
-    (None, '12'), (None, ''),          # open the menu entry, start guided verification
-    (_level(), ''),                    # 1 level
-    (_level(10.0), ''),                # 2 start direction
-    (_level(100.5), ''), (_level(-169.0), ''), (_level(-80.0), ''), (_level(11.0), ''),
-    (None, '0'),
-]
-
-
-def test_guided_verification_all_pass_without_height(clock, tmp_path):
-    rc, out, ser = _guided(clock, tmp_path, GOOD_RUN)
-    assert rc == 0
-    assert ser.writes == []                                   # read-only
-    assert '[合格] 1. 水平' in out.text
-    assert '[合格] 2. 每轉 90°' in out.text
-    assert '[合格] 3. 轉一圈回原位' in out.text
-    assert '[略過] 4. 高度' in out.text and '13' in out.text
-    assert '不合格' not in out.text
-    # Each of the four turns is reported with its measured change.
-    assert out.text.count('第 ') >= 4 and '+90.50°' in out.text
-
-
-def test_guided_verification_reports_failures(clock, tmp_path):
-    steps = [
-        (None, '12'), (None, ''),
-        (_level(roll=1.5), ''),                               # tilted: level fails
-        (_level(0.0), ''),
-        (_level(80.0), ''), (_level(-180.0), ''), (_level(-95.0), ''), (_level(8.0), ''),
-        (None, '0'),
-    ]
-    rc, out, _ = _guided(clock, tmp_path, steps)
-    assert '[不合格] 1. 水平' in out.text
-    assert '[不合格] 2. 每轉 90°' in out.text                  # 80, 100, 85, 103
-    assert '[不合格] 3. 轉一圈回原位' in out.text               # ends 8 deg off
-    assert '全部合格' not in out.text
-
-
-def test_guided_verification_height_step(clock, tmp_path):
-    def at(height_cm, yaw=0.0):
-        return _level(yaw) + _pressure_frame(101325, height_cm)
-    steps = [
-        (None, '12'), (None, ''),
-        (at(0), ''),
-        (None, 's'),                                          # skip the 90 deg turns
-        (None, 's'),                                          # skip the full turn
-        (at(0), ''), (at(95), ''),                            # height: +0.95 m
-        (None, '0'),
-    ]
-    rc, out, _ = _guided(clock, tmp_path, steps)
-    assert '[略過] 2. 每轉 90°' in out.text
-    assert '[略過] 3. 轉一圈回原位' in out.text
-    assert '[合格] 4. 高度' in out.text and '+0.95 m' in out.text
-
-
-def test_guided_verification_can_quit_early(clock, tmp_path):
-    steps = [(None, '12'), (None, ''), (_level(), ''), (None, 'q'), (None, '0')]
-    rc, out, _ = _guided(clock, tmp_path, steps)
-    assert rc == 0
-    assert '[合格] 1. 水平' in out.text
-    assert '已結束驗證' in out.text
-
-
-def test_guided_verification_without_data_does_not_pass(clock, tmp_path):
-    steps = [(None, '12'), (None, ''), (None, ''), (None, 'q'), (None, '0')]
-    rc, out, _ = _guided(clock, tmp_path, steps)
-    assert '[合格]' not in out.text
-    assert '未收到角度資料' in out.text
-
-
-def test_guided_verification_colours_pass_green_and_fail_red(clock, tmp_path):
-    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN, color=True)
-    assert '\033[32m[合格] 1. 水平' in out.text
-    steps = [(None, '12'), (None, ''), (_level(roll=2.0), ''), (None, 'q'), (None, '0')]
-    rc, out, _ = _guided(clock, tmp_path, steps, color=True)
-    assert '\033[31m[不合格] 1. 水平' in out.text
-
-
-def test_guided_verification_has_no_colour_codes_by_default(clock, tmp_path):
-    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
-    assert '\033[' not in out.text
-
-
-def test_guided_verification_serial_error_is_reported(clock, tmp_path):
-    class Broken(FakeSerial):
-
-        def read(self, size=1):
-            raise serial.SerialException('read failed')
-
-    ser = Broken(clock)
-    rc, out, _ = run(ser, ['12', '', '', '0'], clock, tmp_path)
-    assert rc == 0
-    assert 'read failed' in out.text
-    assert '[合格]' not in out.text
-
-
 def test_use_color_only_on_a_tty_without_no_color():
     class Tty:
         def isatty(self):
@@ -1125,22 +1008,6 @@ def test_free_view_keeps_one_line_when_reference_is_set_on_a_terminal(clock, tmp
     assert rc == 0
     assert '參考點已設定' not in out.text
     assert cli.CURSOR_UP_CLEAR in out.text          # the Enter newline is taken back
-
-
-def test_guided_verification_redraws_the_screen_on_a_terminal(clock, tmp_path):
-    """On a terminal each step clears the screen so old lines do not pile up."""
-    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN, color=True)
-    assert out.text.count(cli.CLEAR_SCREEN) >= 6
-    # After the last redraw only the final table remains: each result once.
-    tail = out.text.rsplit(cli.CLEAR_SCREEN, 1)[1]
-    assert tail.count('1. 水平') == 1
-    assert tail.count('2. 每轉 90°') == 1
-    assert '全部合格' not in tail or tail.count('全部合格') == 1
-
-
-def test_guided_verification_does_not_clear_the_screen_without_a_terminal(clock, tmp_path):
-    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
-    assert cli.CLEAR_SCREEN not in out.text
 
 
 # ------------------------------------ menu marks steps done in this session
@@ -1217,128 +1084,222 @@ def test_menu_marks_done_without_colour_codes_off_a_terminal(clock, tmp_path):
     assert '\033[' not in last
 
 
-def test_passed_guided_verification_marks_option_12(clock, tmp_path):
-    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN, color=True)
-    assert cli.DONE_MARK in _menu_row(_menu_blocks(out)[-1], 12)
+# ------------------------------------------- calibration check (option 12)
+
+G0 = wp.GRAVITY
 
 
-def test_failed_guided_verification_does_not_mark_option_12(clock, tmp_path):
-    steps = [(None, '12'), (None, ''), (_level(roll=2.0), ''), (None, 'q'), (None, '0')]
-    rc, out, _ = _guided(clock, tmp_path, steps, color=True)
-    assert cli.DONE_MARK not in _menu_blocks(out)[-1]
+def _acc_frame(x, y, z):
+    raw = [int(round(v / (16.0 * G0) * 32768)) for v in (x, y, z)]
+    return make_frame(0x51, i16(raw[0], raw[1], raw[2], 2500))
 
 
-# ------------------------- auto-advance and live values on a terminal (12)
+STILL = _gyro_frame(0.0, 0.0, 0.0)
 
-class _AutoRun:
+
+def _face_stream(axis, sign, bias=(0.0, 0.0, 0.0)):
+    v = [0.0, 0.0, 0.0]
+    v[cc.axis_index(axis)] = sign * G0
+    return _acc_frame(*(a + b for a, b in zip(v, bias))) + STILL
+
+
+def _mag_check_stream(dip_deg=36.0, radius=4000.0, offset=(0.0, 0.0, 0.0), n=150):
+    """Field directions all over the sphere, each with the matching gravity reading."""
+    dip = math.radians(dip_deg)
+    out = b''
+    for i in range(n):
+        z = 1 - 2 * (i + 0.5) / n
+        r = math.sqrt(1 - z * z)
+        phi = i * math.pi * (3 - math.sqrt(5))
+        u = (r * math.cos(phi), r * math.sin(phi), z)          # field direction in the body
+        p = (-u[1], u[0], 0.0) if abs(u[2]) < 0.9 else (0.0, -u[2], u[1])
+        pn = math.sqrt(sum(c * c for c in p))
+        p = tuple(c / pn for c in p)
+        down = tuple(math.sin(dip) * a + math.cos(dip) * b for a, b in zip(u, p))
+        out += _acc_frame(*(-G0 * d for d in down)) + STILL
+        out += _mag_frame(*(round(radius * c + o) for c, o in zip(u, offset)))
+    return out
+
+
+class _Check:
     """
-    Drive the guided verification the way a terminal does.
+    Run option 12 on a fake terminal.
 
-    ``steps`` has one entry per verification prompt: (stream, key).  ``stream``
-    is what the IMU sends during that prompt; ``key`` is the line typed
-    (None = nothing is typed, so only auto-advance can finish the step).
+    ``steps`` has one (stream, key, delay_s) entry per prompt of the check, in
+    order.  The stream is what the IMU sends from then on; the key is typed
+    ``delay_s`` simulated seconds later (None = never, the step must end by
+    itself).
     """
 
-    def __init__(self, clock, tmp_path, steps, menu_answers=('12', ''), max_reads=4000):
+    def __init__(self, clock, tmp_path, steps, entry='', max_reads=60000,
+                 config=None):
+        self.clock = clock
         self.ser = FakeSerial(clock)
         self.steps = list(steps)
-        self.pending_key = None
-        self.answers = list(menu_answers)
+        self.key = None
+        self.due = 0.0
+        self.menu = ['12', entry]
         self.lines = []
-        self.reads_left = max_reads
+        self.reads = 0
         real_read = self.ser.read
 
         def guarded_read(size=1):
-            self.reads_left -= 1
-            if self.reads_left < 0:          # a step that never ends would hang the test
-                raise AssertionError('guided verification did not advance:\n'
-                                     + self.text[-1500:])
+            self.reads += 1
+            if self.reads > max_reads:
+                raise AssertionError('check did not finish:\n' + self.text[-1500:])
             return real_read(size)
         self.ser.read = guarded_read
-        self.rc = cli.run_menu(self.ser, self._input, self._output, tmp_path / 'c.yaml',
-                               sleep_fn=clock.sleep, time_fn=clock.time, color=True,
-                               key_ready=lambda: self.pending_key is not None)
+        self.rc = cli.run_menu(self.ser, self._input, self._output,
+                               config or tmp_path / 'c.yaml', sleep_fn=clock.sleep,
+                               time_fn=clock.time, color=True,
+                               key_ready=lambda: self.key is not None
+                               and self.clock.now >= self.due)
+
+    def _next_step(self):
+        stream, key, delay = self.steps.pop(0)
+        if stream is not None:
+            self.ser.stream = stream
+        self.key, self.due = key, self.clock.now + delay
 
     def _output(self, *args, **kwargs):
         line = ' '.join(str(a) for a in args)
         self.lines.append(line)
-        if 's 略過' in line and self.steps:    # a verification prompt was just shown
-            stream, key = self.steps.pop(0)
-            if stream is not None:
-                self.ser.stream = stream
-            self.pending_key = key
+        if 's 略過 / q 結束' in line and self.steps:
+            self._next_step()
 
     def _input(self, prompt=''):
-        if self.pending_key is not None:
-            key, self.pending_key = self.pending_key, None
+        if '磁傾角' in prompt and self.steps:
+            self._next_step()
+        if self.key is not None:
+            key, self.key = self.key, None
             return key
-        if self.answers:
-            return self.answers.pop(0)
-        return '0'
+        return self.menu.pop(0) if self.menu else '0'
 
     @property
     def text(self):
         return '\n'.join(self.lines)
 
 
-def test_guided_verification_advances_by_itself_when_in_range(clock, tmp_path):
-    """Level and each 90 degree turn finish without Enter once the reading passes."""
-    run = _AutoRun(clock, tmp_path, [
-        (_level(), None),                    # 1 level: passes on its own
-        (_level(10.0), ''),                  # start direction: Enter (nothing to judge)
-        (_level(100.5), None), (_level(-169.0), None),
-        (_level(-80.0), None), (_level(11.0), None),
-    ])
+def _good_steps(dip_answer='36'):
+    faces = [(_face_stream(a, s), None, 0) for a, s in cc.FACES]
+    return faces + [
+        (STILL + _acc_frame(0, 0, G0), None, 0),                     # gyro at rest
+        (STILL + _acc_frame(0, 0, G0), '', 0),                       # align with the line
+        (_gyro_frame(0, 0, 36.0) + _acc_frame(0, 0, G0), '', 10.05),  # one turn in 10 s
+        (None, dip_answer, 0),                                       # local inclination
+        (_mag_check_stream(), None, 0),                              # magnetometer
+    ]
+
+
+@pytest.fixture
+def short_still(monkeypatch):
+    """Shorten the 5 minute static gyro test for the unit tests."""
+    monkeypatch.setattr(cli, 'GYRO_STILL_S', 3.0)
+
+
+def test_check_passes_a_good_imu_and_marks_option_12(clock, tmp_path, short_still):
+    run = _Check(clock, tmp_path, _good_steps())
     assert run.rc == 0
-    assert '[合格] 1. 水平' in run.text
-    assert '[合格] 2. 每轉 90°' in run.text
-    assert '[合格] 3. 轉一圈回原位' in run.text
-    assert '[不合格]' not in run.text
-    assert run.ser.writes == []
+    for item in ('1. 加速度計', '2. 陀螺儀 靜止', '3. 陀螺儀 轉一圈', '4. 磁力計 合成大小',
+                 '5. 磁力計 磁傾角'):
+        assert f'[合格] {item}' in run.text, item
+    assert '5/5 項全部合格' in run.text
+    last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
+    assert cli.DONE_MARK in _menu_row(last_menu, 12)
+    assert run.ser.writes == []                                      # read-only
 
 
-def test_guided_verification_waits_while_out_of_range_then_enter_records(clock, tmp_path):
-    """A reading outside the range never auto-advances; Enter records the failure."""
-    run = _AutoRun(clock, tmp_path, [
-        (_level(), None),
-        (_level(0.0), ''),
-        (_level(80.0), ''),                  # only 80 deg: the user gives up and presses Enter
-        (None, 'q'),
-    ])
-    assert '第 1 次 Δyaw +80.00°' in run.text
-    assert '[不合格]' in run.text
-    assert '[合格] 2. 每轉 90°' not in run.text
+def test_check_finds_an_accelerometer_offset(clock, tmp_path, short_still):
+    steps = [(_face_stream(a, s, bias=(0.3, 0.0, 0.0)), None, 0) for a, s in cc.FACES]
+    run = _Check(clock, tmp_path, steps + [(None, 'q', 0)])
+    assert '[不合格] 1. 加速度計 六面測試' in run.text
+    assert '偏移 X +0.30' in run.text
 
 
-def test_guided_verification_does_not_advance_while_still_moving(clock, tmp_path):
-    """Passing through the range while turning must not count: it has to hold still."""
-    frames = b''.join(_level(88.0 + 0.5 * (i % 8) * 4) for i in range(8))   # 88..102, jumping
-    run = _AutoRun(clock, tmp_path, [
-        (_level(), None),
-        (_level(0.0), ''),
-        (frames, 'q'),                       # never steady, so q is what ends the step
-    ], max_reads=400)
-    assert '第 1 次' not in run.text
-    assert '已結束驗證' in run.text or '== 驗證結果 ==' in run.text
+def test_check_finds_a_gyro_bias(clock, tmp_path, short_still):
+    steps = [(_gyro_frame(0, 0, 0.13) + _acc_frame(0, 0, G0), None, 0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='2')
+    assert '[不合格] 2. 陀螺儀 靜止測試' in run.text
+    assert 'Z +0.12' in run.text
 
 
-def test_guided_verification_shows_live_values_while_waiting(clock, tmp_path):
-    """The line under the prompt shows the current change and its target."""
-    run = _AutoRun(clock, tmp_path, [
-        (_level(), None),
-        (_level(10.0), ''),
-        (_level(55.0), 'q'),                 # half way: 45 deg so far, then quit
-    ])
-    assert 'roll(X)' in run.text
-    assert 'Δyaw  +45.00°' in run.text and '目標 ±90°' in run.text
+def test_check_applies_the_software_calibration(clock, tmp_path, short_still):
+    """With the bias saved by option 9, the same gyro output passes."""
+    raw_z = _gyro_frame(0, 0, 0.13)
+    z_rad = wp.decode_frame(raw_z).z
+    cfg = tmp_path / 'c.yaml'
+    cal.save_calibration(cfg, cal.SoftwareCalibration(gyro_bias=(0.0, 0.0, z_rad)))
+    steps = [(raw_z + _acc_frame(0, 0, G0), None, 0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='2', config=cfg)
+    assert '已套用軟體校正' in run.text
+    assert '[合格] 2. 陀螺儀 靜止測試' in run.text
 
 
-def test_guided_verification_prompt_explains_auto_advance(clock, tmp_path):
-    run = _AutoRun(clock, tmp_path, [(_level(), None), (None, 'q')])
-    assert '自動' in run.text
+def test_check_gyro_still_restarts_when_moved(clock, tmp_path, short_still):
+    moving = STILL + _acc_frame(0, 0, G0) + STILL + _acc_frame(2.0, 0, G0)
+    run = _Check(clock, tmp_path, [(moving, 's', 6.0), (None, 'q', 0)], entry='2')
+    assert '重新開始' in run.text
+    assert '[略過] 2. 陀螺儀 靜止測試' in run.text
 
 
-def test_guided_verification_has_no_live_line_without_a_terminal(clock, tmp_path):
-    rc, out, _ = _guided(clock, tmp_path, GOOD_RUN)
-    assert '\r' not in out.text
-    assert '自動' not in out.text             # plain prompts: Enter is always required
+def test_check_full_turn_fails_when_the_gyro_reads_short(clock, tmp_path):
+    steps = [(STILL, '', 0), (_gyro_frame(0, 0, 30.0), '', 10.05), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='3')
+    assert '[不合格] 3. 陀螺儀 轉一圈測試' in run.text
+    assert '已轉' in run.text                         # live angle while turning
+
+
+def test_check_magnetometer_detects_hard_iron(clock, tmp_path):
+    """
+    A hard-iron offset is caught by the magnitude test.
+
+    Averaged over every direction the offset cancels in the mean dip angle,
+    so the dip test cannot see it; that is why both tests are needed.
+    """
+    steps = [(None, '36', 0), (_mag_check_stream(offset=(900.0, 0.0, 0.0)), None, 0),
+             (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='4')
+    assert '[不合格] 4. 磁力計 合成大小' in run.text
+
+
+def test_check_magnetometer_compares_with_the_entered_inclination(clock, tmp_path):
+    steps = [(None, '30', 0), (_mag_check_stream(dip_deg=36.0), None, 0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='4')
+    assert '[合格] 4. 磁力計 合成大小' in run.text
+    assert '[不合格] 5. 磁力計 磁傾角:量到 +36.0°,當地 +30.0°' in run.text
+
+
+def test_check_dip_is_skipped_without_an_inclination(clock, tmp_path):
+    steps = [(None, '', 0), (_mag_check_stream(), None, 0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='4')
+    assert '[略過] 5. 磁力計 磁傾角:未輸入當地磁傾角' in run.text
+    assert 'ngdc.noaa.gov' in run.text
+
+
+def test_check_rejects_an_invalid_inclination(clock, tmp_path):
+    steps = [(None, '95', 0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='4')
+    assert '-90 到 90' in run.text
+
+
+def test_check_shows_which_face_is_up(clock, tmp_path):
+    steps = [(_face_stream('X', +1), 's', 3.0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='1')
+    assert '目前:X 軸朝上,請改成 Z 軸朝上' in run.text
+    assert '[略過] 1. 加速度計 六面測試' in run.text
+
+
+def test_check_single_item_does_not_mark_option_12(clock, tmp_path):
+    steps = [(_face_stream(a, s), None, 0) for a, s in cc.FACES] + [(None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='1')
+    assert '[合格] 1. 加速度計 六面測試' in run.text
+    assert '本次已合格 1/5 項' in run.text
+    last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
+    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
+
+
+def test_check_needs_a_terminal(clock, tmp_path):
+    ser = FakeSerial(clock)
+    rc, out, _ = run(ser, ['12', '', '0'], clock, tmp_path)
+    assert '需要在終端機中執行' in out.text
+    assert ser.writes == []
