@@ -1451,3 +1451,17 @@ def test_environment_check_is_skipped_off_a_terminal(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, ['3', 'n', '0'], clock, tmp_path)
     assert '環境與安裝位置檢查需要在終端機中執行' in out.text
+
+
+def test_dual_plane_does_not_ask_whether_the_imu_is_mounted(clock, tmp_path):
+    """Option 4 exists for robots too big to flip, so the IMU is already mounted."""
+    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 3.0)]
+    run = _Check(clock, tmp_path, steps, menu=['4', 'n'])
+    assert not any('裝在車上' in p for p in run.prompts)
+    assert '[合格] 3. 安裝方向' in run.text                 # mounting checks still run
+    assert '4. 馬達干擾' in run.text
+
+
+def test_sphere_fit_still_asks_whether_the_imu_is_mounted(clock, tmp_path):
+    run = _Check(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
+    assert any('裝在車上' in p for p in run.prompts)

@@ -487,7 +487,9 @@ class CalibrationMenu:
 
     def hw_mag(self, mode: wp.CalMode, title: str) -> None:
         """Hardware magnetometer calibration (sphere fit or dual plane)."""
-        if not self._mag_precheck():
+        # Dual plane is for robots too big to flip: the IMU is already mounted.
+        mounted = True if mode == wp.CalMode.MAG_DUAL_PLANE else None
+        if not self._mag_precheck(mounted=mounted):
             return
         if mode == wp.CalMode.MAG_DUAL_PLANE:
             steps = list(DUAL_PLANE_STEPS)
@@ -1244,12 +1246,14 @@ class CalibrationMenu:
             hints.append('振動大:IMU 沒有鎖緊,或太靠近馬達。鎖緊固定、靠近車體中心,'
                          '必要時加一層薄的減震墊。')
 
-    def _mag_precheck(self, report_only: bool = False) -> bool:
+    def _mag_precheck(self, report_only: bool = False, mounted: Optional[bool] = None) -> bool:
         """
         Check the surroundings and the mounting position from the IMU's own readings.
 
         Return True to go on with the magnetometer calibration.  When something
         is unsuitable the user is told why and asked twice before going on.
+        ``mounted`` None asks whether the IMU is on the robot; True skips the
+        question (dual-plane calibration is only used on a mounted IMU).
         """
         if self._key_ready is None:
             self._out('(環境與安裝位置檢查需要在終端機中執行,已略過)')
@@ -1263,7 +1267,9 @@ class CalibrationMenu:
         try:
             accel_mean = self._precheck_still(results, hints)
             self._precheck_slide(results, hints)
-            if self._confirm('IMU 已經裝在車上的最終位置了嗎?'):
+            if mounted is None:
+                mounted = self._confirm('IMU 已經裝在車上的最終位置了嗎?')
+            if mounted:
                 self._precheck_mounting(results, hints, accel_mean)
             else:
                 self._verify_note('IMU 還沒裝上車:裝上去之後,要在最終位置重新檢查與校正。')
