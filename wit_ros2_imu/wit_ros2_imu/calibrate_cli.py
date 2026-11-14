@@ -145,6 +145,11 @@ ENV_STILL_S = 5.0
 SLIDE_DISTANCE_CM = 30
 MOTOR_BASE_S = 3.0
 MOTOR_RUN_S = 5.0
+SLIDE_MOVE_ACCEL = 0.15       # m/s^2 away from the resting reading = the IMU is being slid
+MOTOR_DETECT_VIB = 0.1        # m/s^2 std of |a| (and 3x the stopped value) = motors running
+MOTOR_DETECT_CHANGE = 0.02    # field change vs. stopped (2x the rest noise) = motors running
+MOTOR_SETTLE_S = 1.0          # wait after the motors are detected before recording
+MOTOR_WINDOW = 10             # samples used to detect the motors
 PRECHECK_INTRO = [
     '校正前先用 IMU 自己的讀數檢查環境與安裝位置(約 1 分鐘):',
     '  地磁在一個房間內處處相同、不隨時間改變;讀數若會變動或跟著位置改變,就是周圍有干擾。',
@@ -973,13 +978,13 @@ class CalibrationMenu:
 
     # -------------------------------------- environment / mounting precheck
 
-    def _record_still(self, prompt: str, seconds: float, need_still: bool = True):
+    def _record_still(self, prompt: str, seconds: float):
         """
-        Record ``seconds`` of magnetometer and accelerometer data.
+        Record ``seconds`` of magnetometer and accelerometer data at rest.
 
-        With ``need_still`` the recording starts once the IMU has been still for
-        STILL_HOLD_S and restarts if it moves.  Return a dict with 'mags' and
-        'accels', or None when skipped.
+        The recording starts once the IMU has been still for STILL_HOLD_S and
+        restarts if it moves.  Return a dict with 'mags' and 'accels', or None
+        when skipped.
         """
         st = {'gyro': None, 'hold': None, 'start': None, 'mags': [], 'accels': []}
 
@@ -991,15 +996,15 @@ class CalibrationMenu:
         def on_packet(p, now):
             if isinstance(p, wp.Gyro):
                 st['gyro'] = p
-                if need_still and not self._still(p):
+                if not self._still(p):
                     reset()
                 return
             if st['start'] is None:
-                if need_still and not self._still(st['gyro']):
+                if not self._still(st['gyro']):
                     return
                 if st['hold'] is None:
                     st['hold'] = now
-                if not need_still or now - st['hold'] >= STILL_HOLD_S:
+                if now - st['hold'] >= STILL_HOLD_S:
                     st['start'] = now
             if st['start'] is None:
                 return
@@ -1046,53 +1051,162 @@ class CalibrationMenu:
         return tuple(sum(a[i] for a in data['accels']) / n for i in range(3))
 
     def _precheck_slide(self, results, hints) -> None:
+        """
+        Slide the IMU without turning it; every phase is detected automatically.
+
+        Still for STILL_HOLD_S -> reference taken; acceleration away from the
+        reference -> moving; still again for STILL_HOLD_S -> done.  Turning
+        more than SLIDE_MAX_ROTATION_DEG voids the attempt, which then starts
+        over by itself once the IMU is still again.
+        """
         name = '2. 附近有無鐵件'
-        while True:
-            cmd = self._watch('環境 2/2 平移:IMU(或整台車)擺在起點,按 Enter 開始'
-                              '(s 略過 / q 結束):', lambda now: '準備好後按 Enter')
-            if cmd == 's':
-                self._record(results, SKIP, name)
+        st = {'gyro': None, 'retries': 0, 'last_turn': 0.0}
+
+        def restart():
+            st.update(phase='wait', hold=None, ref_acc=[], ref=[], ref_gyro=[], mags=[],
+                      moved=False, rest=None, meter=None, bias=(0.0, 0.0, 0.0))
+        restart()
+
+        def on_packet(p, now):
+            if isinstance(p, wp.Gyro):
+                st['gyro'] = p
+                vec = (p.x, p.y, p.z)
+                if st['phase'] == 'wait' and st['hold'] is not None:
+                    st['ref_gyro'].append(vec)
+                if st['meter'] is not None:
+                    turned = st['meter'].add(now, [a - b for a, b in zip(vec, st['bias'])])
+                    if not cc.slide_valid(turned):
+                        st['retries'] += 1
+                        st['last_turn'] = turned
+                        restart()
                 return
-            if cmd != '':
-                continue
-            meter = cc.RotationMeter()
-            st = {'ref': [], 'mags': []}
-
-            def on_packet(p, now):
-                if isinstance(p, wp.Gyro):
-                    meter.add(now, (p.x, p.y, p.z))
-                elif isinstance(p, wp.Mag):
-                    vec = (p.x, p.y, p.z)
-                    if len(st['ref']) < 3:
-                        st['ref'].append(vec)
-                    st['mags'].append(vec)
-
-            def status(now):
-                change = (f'{cc.field_change(st["ref"], st["mags"]):.1%}'
-                          if len(st['ref']) >= 3 else '--')
-                warn = '  轉動了,請保持方向不變' if not cc.slide_valid(meter.total_deg) else ''
-                return f'磁場變化 {change}  已轉動 {meter.total_deg:.1f}°{warn}'
-
-            cmd = self._watch(f'  不要轉動,沿桌面或地面平移約 {SLIDE_DISTANCE_CM} cm,停住後按 Enter'
-                              '(s 略過 / q 結束):', status, on_packet)
-            if cmd == 's':
-                self._record(results, SKIP, name)
+            if not isinstance(p, (wp.Accel, wp.Mag)):
                 return
-            if len(st['ref']) < 3 or len(st['mags']) < 5:
-                self._verify_note('  資料不足,請再做一次(平移時間久一點)。')
-                continue
-            if not cc.slide_valid(meter.total_deg):
-                self._verify_note(f'  平移時轉了 {meter.total_deg:.1f}°'
-                                  f'(要在 {cc.SLIDE_MAX_ROTATION_DEG:.0f}° 內),這次不算,請再做一次。')
-                continue
+            vec = (p.x, p.y, p.z)
+            still = self._still(st['gyro'])
+            if st['phase'] == 'wait':
+                if not still:
+                    restart()
+                    return
+                if st['hold'] is None:
+                    st['hold'] = now
+                (st['ref_acc'] if isinstance(p, wp.Accel) else st['ref']).append(vec)
+                if (now - st['hold'] >= STILL_HOLD_S and len(st['ref']) >= 3
+                        and len(st['ref_acc']) >= 3):
+                    st['phase'] = 'slide'
+                    st['mags'] = list(st['ref'])
+                    if st['ref_gyro']:
+                        n = float(len(st['ref_gyro']))
+                        st['bias'] = tuple(sum(g[i] for g in st['ref_gyro']) / n
+                                           for i in range(3))
+                    st['meter'] = cc.RotationMeter()
+                return
+            if isinstance(p, wp.Mag):
+                st['mags'].append(vec)
+                return
+            n = float(len(st['ref_acc']))
+            ref = [sum(a[i] for a in st['ref_acc']) / n for i in range(3)]
+            away = math.sqrt(sum((a - b) ** 2 for a, b in zip(vec, ref))) > SLIDE_MOVE_ACCEL
+            if away or not still:
+                st['moved'] = st['moved'] or away
+                st['rest'] = None
+            elif st['moved'] and st['rest'] is None:
+                st['rest'] = now
+
+        def done(now):
+            return (st['phase'] == 'slide' and st['moved'] and st['rest'] is not None
+                    and now - st['rest'] >= STILL_HOLD_S)
+
+        def status(now):
+            if st['phase'] == 'wait':
+                again = (f'  上次轉了 {st["last_turn"]:.0f}°,不算;停住後自動重來'
+                         if st['retries'] else '')
+                return f'放著不動,準備中...{again}'
             change = cc.field_change(st['ref'], st['mags'])
-            ok = cc.change_ok(change)
-            self._record(results, PASS if ok else FAIL,
-                         f'{name}:平移時磁場變化 {change:.1%}(標準 {cc.ENV_CHANGE_TOL:.0%} 內)')
-            if not ok:
-                hints.append('平移時磁場跟著位置改變:附近有鐵件(鐵桌、鐵櫃、筆電、含鋼筋的地板)。'
-                             '換到木桌或空曠處,或把 IMU 墊高遠離地面。')
-            return
+            turned = st['meter'].total_deg if st['meter'] is not None else 0.0
+            if not st['moved']:
+                return f'準備好了:不要轉動,開始平移  磁場變化 {change:.1%}'
+            state = '停住了,確認中...' if st['rest'] is not None else '平移中...'
+            return f'{state}  磁場變化 {change:.1%}  已轉動 {turned:.1f}°'
+
+        prompt = (f'環境 2/2 平移:IMU(或整台車)放在起點不動,等畫面顯示「準備好了」,'
+                  f'不要轉動,沿桌面或地面平移約 {SLIDE_DISTANCE_CM} cm 再停住。全程自動'
+                  '(s 略過 / q 結束):')
+        while True:
+            cmd = self._watch(prompt, status, on_packet, done)
+            if cmd == 's':
+                self._record(results, SKIP, name)
+                return
+            if cmd is None or (st['phase'] == 'slide' and st['moved']):
+                break
+            self._out('還沒偵測到平移;準備好了之後,不要轉動地移動 IMU。')
+        change = cc.field_change(st['ref'], st['mags'])
+        ok = cc.change_ok(change)
+        self._record(results, PASS if ok else FAIL,
+                     f'{name}:平移時磁場變化 {change:.1%}(標準 {cc.ENV_CHANGE_TOL:.0%} 內)')
+        if not ok:
+            hints.append('平移時磁場跟著位置改變:附近有鐵件(鐵桌、鐵櫃、筆電、含鋼筋的地板)。'
+                         '換到木桌或空曠處,或把 IMU 墊高遠離地面。')
+
+    def _record_motors(self, base):
+        """
+        Record MOTOR_RUN_S of data once the motors are detected running.
+
+        Running = more vibration or a field change compared with ``base``
+        (motors stopped).  A mounting good enough to show neither cannot be
+        detected, so Enter starts the recording by hand.  Return the data or
+        None when skipped.
+        """
+        base_vib = cc.vibration(base['accels'])
+        st = {'acc_win': [], 'mag_win': [], 'detected': None, 'start': None,
+              'mags': [], 'accels': []}
+
+        def on_packet(p, now):
+            if not isinstance(p, (wp.Accel, wp.Mag)):
+                return
+            vec = (p.x, p.y, p.z)
+            if isinstance(p, wp.Accel):
+                st['acc_win'] = (st['acc_win'] + [vec])[-MOTOR_WINDOW:]
+                if st['start'] is not None:
+                    st['accels'].append(vec)
+            else:
+                st['mag_win'] = (st['mag_win'] + [vec])[-MOTOR_WINDOW:]
+                if st['start'] is not None:
+                    st['mags'].append(vec)
+            if st['start'] is not None:
+                return
+            if st['detected'] is None:
+                shaking = (len(st['acc_win']) >= 5 and cc.vibration(st['acc_win'])
+                           > max(MOTOR_DETECT_VIB, 3.0 * base_vib))
+                field = (len(st['mag_win']) >= 3 and cc.field_change(base['mags'], st['mag_win'])
+                         > MOTOR_DETECT_CHANGE)
+                if shaking or field:
+                    st['detected'] = now
+            elif now - st['detected'] >= MOTOR_SETTLE_S:
+                st['start'] = now
+
+        def done(now):
+            return (st['start'] is not None and now - st['start'] >= MOTOR_RUN_S
+                    and len(st['mags']) >= 3 and len(st['accels']) >= 3)
+
+        def status(now):
+            if st['start'] is not None:
+                bar = progress_bar((now - st['start']) / MOTOR_RUN_S, 10)
+                return f'量測中,馬達保持轉動 {bar}'
+            if st['detected'] is not None:
+                return '偵測到馬達轉動,等它轉穩...'
+            return '等待馬達轉動...(馬達已經在轉卻沒反應,代表影響很小,按 Enter 開始量)'
+
+        prompt = (f'安裝 2/2:讓馬達以平常的速度轉起來,偵測到會自動量 {MOTOR_RUN_S:.0f} 秒'
+                  '(Enter 立即開始 / s 略過 / q 結束):')
+        while True:
+            cmd = self._watch(prompt, status, on_packet, done)
+            if cmd is None:
+                return st
+            if cmd == 's':
+                return None
+            if cmd == '' and st['start'] is None:
+                st['start'] = self._time()
 
     def _precheck_mounting(self, results, hints, accel_mean) -> None:
         if accel_mean is not None:
@@ -1110,12 +1224,7 @@ class CalibrationMenu:
         base = self._record_still(
             f'安裝 1/2:車子通電,把車架高讓輪子懸空,馬達先不要轉。自動記錄 {MOTOR_BASE_S:.0f} 秒'
             '(s 略過 / q 結束):', MOTOR_BASE_S)
-        cmd = None if base is None else self._watch(
-            '安裝 2/2:讓馬達以平常的速度轉起來,轉穩後按 Enter(s 略過 / q 結束):',
-            lambda now: '馬達轉穩後按 Enter')
-        running = None if base is None or cmd == 's' else self._record_still(
-            f'  量測中,馬達保持轉動,自動記錄 {MOTOR_RUN_S:.0f} 秒(s 略過 / q 結束):',
-            MOTOR_RUN_S, need_still=False)
+        running = None if base is None else self._record_motors(base)
         if running is None:
             for name in names:
                 self._record(results, SKIP, name)

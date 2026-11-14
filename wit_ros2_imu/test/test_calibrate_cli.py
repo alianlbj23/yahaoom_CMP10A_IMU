@@ -1144,10 +1144,15 @@ class _Check:
         self.reads = 0
         real_read = self.ser.read
 
+        self.timeline = []
+
         def guarded_read(size=1):
             self.reads += 1
             if self.reads > max_reads:
                 raise AssertionError('check did not finish:\n' + self.text[-1500:])
+            while self.timeline and self.clock.now >= self.timeline[0][0]:
+                self.ser.stream = self.timeline.pop(0)[1]
+                self.ser._rx.clear()
             return real_read(size)
         self.ser.read = guarded_read
         self.rc = cli.run_menu(self.ser, self._input, self._output,
@@ -1158,7 +1163,10 @@ class _Check:
 
     def _next_step(self):
         stream, key, delay = self.steps.pop(0)
-        if stream is not None:
+        if isinstance(stream, list):              # [(seconds after the prompt, bytes), ...]
+            self.timeline = [(self.clock.now + t, b) for t, b in stream]
+        elif stream is not None:
+            self.timeline = []
             self.ser.stream = stream
         self.key, self.due = key, self.clock.now + delay
 
@@ -1315,13 +1323,19 @@ def _env_stream(mag=(4000, 0, 0), accel=(0.0, 0.0, G0), gyro=STILL):
 
 STEADY = _env_stream()
 NOISY = _env_stream() + _env_stream(mag=(4300, 0, 0))            # field jumps 7 %
-NEAR_IRON = _env_stream() + _env_stream(mag=(4000, 700, 0))      # changes with position
+NEAR_IRON_END = _env_stream(mag=(4000, 700, 0))                  # field differs at the new place
 MOTORS = (_env_stream(mag=(4000, 600, 0), accel=(0.0, 0.0, G0 + 2.0))
           + _env_stream(mag=(4000, -600, 0), accel=(0.0, 0.0, G0 - 2.0)))
 
 
-def _env_steps(still=STEADY, slide=STEADY):
-    return [(still, None, 0), (STEADY, '', 0), (slide, '', 2.0)]
+def _slide(start=STEADY, end=STEADY, moving=None):
+    """IMU data during the slide: at rest, being pushed, at rest in the new place."""
+    moving = moving or _env_stream(accel=(0.6, 0.0, G0))
+    return [(0.0, start), (2.5, moving), (3.5, end)]
+
+
+def _env_steps(still=STEADY, end=STEADY):
+    return [(still, None, 0), (_slide(end=end), None, 0)]
 
 
 MAG_SPHERE_CMD = wp.cmd_calsw(wp.CalMode.MAG_SPHERE)
@@ -1347,7 +1361,7 @@ def test_unsuitable_place_is_explained_and_can_be_cancelled(clock, tmp_path):
 
 def test_unsuitable_place_asks_a_second_time(clock, tmp_path):
     """Saying yes once is not enough: the second question can still cancel."""
-    run = _Check(clock, tmp_path, _env_steps(slide=NEAR_IRON), menu=['3', 'n', 'y', 'n'])
+    run = _Check(clock, tmp_path, _env_steps(end=NEAR_IRON_END), menu=['3', 'n', 'y', 'n'])
     assert '[不合格] 2. 附近有無鐵件' in run.text
     assert any('仍要在這裡繼續校正' in p for p in run.prompts)
     assert any('再確認一次' in p for p in run.prompts)
@@ -1356,23 +1370,43 @@ def test_unsuitable_place_asks_a_second_time(clock, tmp_path):
 
 
 def test_user_who_insists_twice_gets_the_calibration(clock, tmp_path):
-    run = _Check(clock, tmp_path, _env_steps(slide=NEAR_IRON),
+    run = _Check(clock, tmp_path, _env_steps(end=NEAR_IRON_END),
                  menu=['3', 'n', 'y', 'y', 'y', ''])
     assert '依你的選擇,繼續校正' in run.text
     assert MAG_SPHERE_CMD in run.ser.writes
 
 
-def test_slide_that_turns_is_not_counted(clock, tmp_path):
-    turning = _env_stream(gyro=_gyro_frame(0, 0, 10.0))
-    steps = [(STEADY, None, 0), (STEADY, '', 0), (turning, '', 2.0), (None, 's', 0)]
-    run = _Check(clock, tmp_path, steps, menu=['3', 'n', 'n'])
-    assert '這次不算' in run.text
-    assert '[略過] 2. 附近有無鐵件' in run.text
+def test_slide_that_turns_starts_over_by_itself(clock, tmp_path):
+    """Turning voids the attempt; it restarts on its own and then passes."""
+    turning = _env_stream(gyro=_gyro_frame(0, 0, 10.0), accel=(0.6, 0.0, G0))
+    slide = [(0.0, STEADY), (2.5, turning), (3.5, STEADY),
+             (6.0, _env_stream(accel=(0.6, 0.0, G0))), (7.0, STEADY)]
+    run = _Check(clock, tmp_path, [(STEADY, None, 0), (slide, None, 0)], menu=['3', 'n', 'n'])
+    assert '不算;停住後自動重來' in run.text
+    assert '[合格] 2. 附近有無鐵件' in run.text
+
+
+def test_slide_finishes_without_any_key(clock, tmp_path):
+    run = _Check(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
+    assert '準備好了:不要轉動,開始平移' in run.text
+    assert '[合格] 2. 附近有無鐵件' in run.text
+
+
+def test_slide_ignores_the_gyro_bias_of_an_uncalibrated_imu(clock, tmp_path):
+    """A 1 deg/s bias would add up past 3 deg; the bias seen at rest is removed."""
+    biased = _gyro_frame(0, 0, 1.0)
+    rest = _env_stream(gyro=biased)
+    slide = [(0.0, rest), (2.5, _env_stream(gyro=biased, accel=(0.6, 0.0, G0))),
+             (5.0, rest)]
+    run = _Check(clock, tmp_path, [(rest, None, 0), (slide, None, 0)], menu=['3', 'n', 'n'])
+    assert '[合格] 2. 附近有無鐵件' in run.text
 
 
 def test_mounting_position_near_motors_is_reported(clock, tmp_path):
-    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 0), (MOTORS, None, 0)]
+    # The motors are found by themselves: no key is pressed.
+    steps = _env_steps() + [(STEADY, None, 0), (MOTORS, None, 0)]
     run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'n'])
+    assert '偵測到馬達轉動' in run.text
     assert '[合格] 3. 安裝方向' in run.text
     assert '[不合格] 4. 馬達干擾' in run.text
     assert '[不合格] 5. 振動' in run.text
@@ -1383,8 +1417,10 @@ def test_mounting_position_near_motors_is_reported(clock, tmp_path):
 def test_tilted_mounting_is_a_note_not_a_failure(clock, tmp_path):
     tilted = _env_stream(accel=(G0 * math.sin(math.radians(10)), 0.0,
                                 G0 * math.cos(math.radians(10))))
-    steps = [(tilted, None, 0), (tilted, '', 0), (tilted, '', 2.0),
-             (STEADY, None, 0), (STEADY, '', 0), (STEADY, None, 0)]
+    moving = _env_stream(accel=(G0 * math.sin(math.radians(10)) + 0.6, 0.0,
+                                G0 * math.cos(math.radians(10))))
+    steps = [(tilted, None, 0), (_slide(tilted, tilted, moving), None, 0),
+             (STEADY, None, 0), (STEADY, '', 3.0)]        # well mounted: Enter starts the run
     run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'y', ''])
     assert '[注意] 3. 安裝方向:傾斜 10.0°' in run.text
     assert '環境與安裝位置合適' in run.text
@@ -1399,7 +1435,7 @@ def test_software_mag_calibration_is_checked_too(clock, tmp_path):
 
 
 def test_option_12_can_check_the_place_without_calibrating(clock, tmp_path):
-    run = _Check(clock, tmp_path, _env_steps(slide=NEAR_IRON), menu=['12', '5', 'n'])
+    run = _Check(clock, tmp_path, _env_steps(end=NEAR_IRON_END), menu=['12', '5', 'n'])
     assert '[不合格] 2. 附近有無鐵件' in run.text
     assert not any('仍要在這裡繼續校正' in p for p in run.prompts)
     assert run.ser.writes == []
