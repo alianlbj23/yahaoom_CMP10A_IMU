@@ -517,7 +517,8 @@ def missing_network_message(name: str) -> str:
         'Docker 網路 %s 不存在,無法啟動。' % name,
         '  • 這個網路若由 docker compose 管理,請先啟動那份 compose:',
         '        docker compose up -d',
-        '    (compose 建立的網路名稱是「資料夾名稱_網路名稱」)',
+        '    (compose 建立的網路名稱通常是「專案名稱_網路名稱」;專案名稱預設為'
+        'compose 檔所在資料夾的名稱,轉成小寫並去掉不合法字元)',
         '  • 用 docker network ls 查看現有的網路名稱。',
         '  • 或在選單 8 把網路改回 bridge (Docker 預設網路) 或 host。',
         '本工具不會自動建立網路。',
@@ -741,7 +742,7 @@ class Launcher:
             print('  其他名稱:自訂的 Docker 網路,同一個網路上的容器看得到 '
                   'topic。')
             print('  (compose 檔裡的 driver: bridge 是類型;要填的是它的名稱,'
-                  '通常是「資料夾名稱_網路名稱」)')
+                  '通常是「專案名稱_網路名稱」,以 docker network ls 為準)')
             if names:
                 print('  目前電腦上的 Docker 網路:%s' % '、'.join(names))
             text = self.input_func('網路名稱 (直接 Enter 不變更,目前 %s): '

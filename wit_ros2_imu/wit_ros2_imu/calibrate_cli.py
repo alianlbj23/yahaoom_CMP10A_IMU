@@ -140,6 +140,8 @@ DIP_MIN_PAIRS = 20
 NOAA_CALCULATOR = 'https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml'
 CHECK_ITEMS = ('accel', 'gyro_still', 'gyro_turn', 'mag_norm', 'mag_dip')
 CHECK_TITLE = '== 校正檢測 =='
+ITEM_LABELS = {'accel': '1. 加速度計', 'gyro_still': '2. 陀螺儀 靜止', 'gyro_turn': '3. 陀螺儀 轉一圈',
+               'mag': '4–5. 磁力計'}
 # Environment / mounting check before a magnetometer calibration.
 ENV_STILL_S = 5.0
 SLIDE_DISTANCE_CM = 30
@@ -150,6 +152,7 @@ MOTOR_DETECT_VIB = 0.1        # m/s^2 std of |a| (and 3x the stopped value) = mo
 MOTOR_DETECT_CHANGE = 0.02    # field change vs. stopped (2x the rest noise) = motors running
 MOTOR_SETTLE_S = 1.0          # wait after the motors are detected before recording
 MOTOR_WINDOW = 10             # samples used to detect the motors
+MOTOR_ENTER_AFTER_S = 10.0    # Enter starts the run by hand only after this long undetected
 PRECHECK_INTRO = [
     '校正前先用 IMU 自己的讀數檢查環境與安裝位置(約 1 分鐘):',
     '  地磁在一個房間內處處相同、不隨時間改變;讀數若會變動或跟著位置改變,就是周圍有干擾。',
@@ -488,8 +491,9 @@ class CalibrationMenu:
     def hw_mag(self, mode: wp.CalMode, title: str) -> None:
         """Hardware magnetometer calibration (sphere fit or dual plane)."""
         # Dual plane is for robots too big to flip: the IMU is already mounted.
-        mounted = True if mode == wp.CalMode.MAG_DUAL_PLANE else None
-        if not self._mag_precheck(mounted=mounted):
+        is_dual_plane = mode == wp.CalMode.MAG_DUAL_PLANE
+        if not self._mag_precheck(mounted=True if is_dual_plane else None,
+                                  notes_choice='4' if is_dual_plane else '3'):
             return
         if mode == wp.CalMode.MAG_DUAL_PLANE:
             steps = list(DUAL_PLANE_STEPS)
@@ -578,7 +582,7 @@ class CalibrationMenu:
 
     def sw_mag(self) -> None:
         """Software magnetometer hard-iron calibration written to YAML."""
-        if not self._mag_precheck():
+        if not self._mag_precheck(notes_choice='10'):
             return
         self._out('== 軟體磁力計 hard-iron 校正 ==')
         self._out('按 Enter 後開始取樣,期間請將 IMU 繞三軸緩慢轉動(遠離金屬與磁鐵)。')
@@ -709,6 +713,13 @@ class CalibrationMenu:
         finally:
             self._end_status()
 
+    def _set_passed(self, item: str, ok: bool) -> None:
+        """Keep the latest outcome of a check item: a failure cancels an earlier pass."""
+        if ok:
+            self._check_passed.add(item)
+        else:
+            self._check_passed.discard(item)
+
     @staticmethod
     def _still(gyro) -> bool:
         if gyro is None:
@@ -786,20 +797,28 @@ class CalibrationMenu:
                      f'{name}:各面 |a| 與 {wp.GRAVITY:.2f} 差 ±{cc.ACCEL_MAG_TOL} 內 '
                      f'{"是" if acc.magnitudes_ok else "否"};偏移 X {ox:+.3f} Y {oy:+.3f} '
                      f'Z {oz:+.3f} m/s²(標準 ±{cc.ACCEL_OFFSET_TOL})')
-        if acc.ok:
-            self._check_passed.add('accel')
+        self._set_passed('accel', acc.ok)
 
     # -- 2. gyroscope at rest against zero rotation
 
     def _check_gyro_still(self, results) -> None:
         name = '2. 陀螺儀 靜止測試'
-        st = {'gyro': None, 'ref': None, 'hold': None, 'start': None, 'samples': [],
-              'restarts': 0, 'accel': None}
+        st = {'gyro': None, 'ref': None, 'ref_gyro': None, 'hold': None, 'start': None,
+              'samples': [], 'restarts': 0, 'accel': None}
 
         def start(now):
             st['start'] = now
             st['ref'] = st['accel']
+            st['ref_gyro'] = st['gyro']
             st['samples'] = []
+
+        def turned(p) -> bool:
+            # Compared with the rate at the start, so a large bias is not "turning".
+            ref = st['ref_gyro']
+            if ref is None:
+                return False
+            diff = math.sqrt((p.x - ref.x) ** 2 + (p.y - ref.y) ** 2 + (p.z - ref.z) ** 2)
+            return math.degrees(diff) > STILL_GYRO_DPS
 
         def moved(p) -> bool:
             ref = st['ref']
@@ -809,7 +828,10 @@ class CalibrationMenu:
         def on_packet(p, now):
             if isinstance(p, wp.Gyro):
                 st['gyro'] = p
-                if st['start'] is not None:
+                if st['start'] is not None and turned(p):
+                    st['start'] = st['hold'] = None
+                    st['restarts'] += 1
+                elif st['start'] is not None:
                     st['samples'].append((p.x, p.y, p.z))
             elif isinstance(p, wp.Accel):
                 st['accel'] = p
@@ -847,7 +869,9 @@ class CalibrationMenu:
             if cmd == 's':
                 self._record(results, SKIP, name)
                 return
-            if cmd == '' and st['accel'] is not None:
+            if cmd == '' and st['start'] is not None:
+                self._out('量測中,不用按 Enter;要中斷請按 s 或 q。')
+            elif cmd == '' and st['accel'] is not None:
                 start(self._time())
         bias = cc.gyro_bias_dps(st['samples'])
         ok = cc.gyro_bias_ok(bias)
@@ -855,8 +879,7 @@ class CalibrationMenu:
                      f'{name}:平均 X {bias[0]:+.3f} Y {bias[1]:+.3f} Z {bias[2]:+.3f} °/s'
                      f'(標準 ±{cc.GYRO_BIAS_TOL_DPS};Z 軸換算每分鐘漂 '
                      f'{abs(bias[2]) * 60:.1f}°)')
-        if ok:
-            self._check_passed.add('gyro_still')
+        self._set_passed('gyro_still', ok)
 
     # -- 3. gyroscope: one full turn against a reference line
 
@@ -895,23 +918,28 @@ class CalibrationMenu:
         self._record(results, PASS if ok else FAIL,
                      f'{name}:陀螺儀累加 {angle:+.1f}°(標準 ±{cc.TURN_TARGET_DEG:.0f}° '
                      f'±{cc.TURN_TOL_DEG:.0f}°)')
-        if ok:
-            self._check_passed.add('gyro_turn')
+        self._set_passed('gyro_turn', ok)
 
     # -- 4. magnetometer: constant |B| and the local dip angle
 
     def _ask_dip(self) -> Optional[float]:
-        if self._expected_dip is not None:
-            return self._expected_dip
+        """Ask the local inclination every time, offering the last value."""
         self._verify_redraw()
         self._out(f'磁傾角:到 NOAA 地磁計算器輸入所在位置,查 Inclination:{NOAA_CALCULATOR}')
         self._out('  (台灣約 30–37°,依地點不同)')
+        last = self._expected_dip
+        if last is None:
+            prompt = '輸入當地磁傾角(度);直接 Enter 略過磁傾角判定:'
+        else:
+            prompt = f'輸入當地磁傾角(度);直接 Enter 使用上次 {last:.1f},s 略過磁傾角判定:'
         while True:
-            text = self._ask('輸入當地磁傾角(度);直接 Enter 略過磁傾角判定:')
+            text = self._ask(prompt)
             if text.lower() == 'q':
                 raise _VerifyQuit
-            if not text:
+            if text.lower() == 's':
                 return None
+            if not text:
+                return last
             try:
                 self._expected_dip = cc.parse_dip(text)
                 return self._expected_dip
@@ -922,7 +950,10 @@ class CalibrationMenu:
         name_norm = '4. 磁力計 合成大小'
         name_dip = '5. 磁力計 磁傾角'
         expected = self._ask_dip()
-        cov = MagCoverage(None, target=MAG_COVERAGE_TARGET)
+        # Coverage is judged from the gravity direction (accelerometer), not from
+        # the magnetometer itself: it shows every face has been up and down,
+        # whatever state the magnetometer calibration is in.
+        cov = MagCoverage(wp.GRAVITY, target=MAG_COVERAGE_TARGET)
         st = {'gyro': None, 'accel': None, 'mags': [], 'pairs': []}
 
         def on_packet(p, now):
@@ -930,10 +961,10 @@ class CalibrationMenu:
                 st['gyro'] = p
             elif isinstance(p, wp.Accel):
                 st['accel'] = p
+                cov.add(p)
             elif isinstance(p, wp.Mag):
                 vec = (p.x, p.y, p.z)
                 st['mags'].append(vec)
-                cov.add(p)
                 a, g = st['accel'], st['gyro']
                 if a is not None and g is not None:
                     rate = math.degrees(math.sqrt(g.x ** 2 + g.y ** 2 + g.z ** 2))
@@ -963,8 +994,7 @@ class CalibrationMenu:
             self._record(results, PASS if ok else FAIL,
                          f'{name_norm}:{cc.MAG_SPREAD_SHARE:.0%} 的讀數在平均值 '
                          f'±{spread:.1%} 內(標準 ±{cc.MAG_SPREAD_TOL:.0%})')
-            if ok:
-                self._check_passed.add('mag_norm')
+            self._set_passed('mag_norm', ok)
         if expected is None:
             self._record(results, SKIP, f'{name_dip}:未輸入當地磁傾角')
         elif len(st['pairs']) < DIP_MIN_PAIRS:
@@ -975,8 +1005,7 @@ class CalibrationMenu:
             self._record(results, PASS if ok else FAIL,
                          f'{name_dip}:量到 {dip:+.1f}°,當地 {expected:+.1f}°'
                          f'(標準 ±{cc.DIP_TOL_DEG:.0f}°)')
-            if ok:
-                self._check_passed.add('mag_dip')
+            self._set_passed('mag_dip', ok)
 
     # -------------------------------------- environment / mounting precheck
 
@@ -1033,7 +1062,7 @@ class CalibrationMenu:
                 return None
             self._out('這一步會自動記錄,不用按 Enter。')
 
-    def _precheck_still(self, results, hints) -> Optional[Tuple[float, float, float]]:
+    def _precheck_field_at_rest(self, results, hints) -> Optional[Tuple[float, float, float]]:
         """Return the mean acceleration at rest (for the mounting tilt), or None."""
         name = '1. 磁場穩定'
         data = self._record_still(
@@ -1161,7 +1190,7 @@ class CalibrationMenu:
         """
         base_vib = cc.vibration(base['accels'])
         st = {'acc_win': [], 'mag_win': [], 'detected': None, 'start': None,
-              'mags': [], 'accels': []}
+              'mags': [], 'accels': [], 'since': self._time()}
 
         def on_packet(p, now):
             if not isinstance(p, (wp.Accel, wp.Mag)):
@@ -1180,9 +1209,10 @@ class CalibrationMenu:
             if st['detected'] is None:
                 shaking = (len(st['acc_win']) >= 5 and cc.vibration(st['acc_win'])
                            > max(MOTOR_DETECT_VIB, 3.0 * base_vib))
-                field = (len(st['mag_win']) >= 3 and cc.field_change(base['mags'], st['mag_win'])
-                         > MOTOR_DETECT_CHANGE)
-                if shaking or field:
+                field_changed = (len(st['mag_win']) >= 3
+                                 and cc.field_change(base['mags'], st['mag_win'])
+                                 > MOTOR_DETECT_CHANGE)
+                if shaking or field_changed:
                     st['detected'] = now
             elif now - st['detected'] >= MOTOR_SETTLE_S:
                 st['start'] = now
@@ -1197,17 +1227,24 @@ class CalibrationMenu:
                 return f'量測中,馬達保持轉動 {bar}'
             if st['detected'] is not None:
                 return '偵測到馬達轉動,等它轉穩...'
-            return '等待馬達轉動...(馬達已經在轉卻沒反應,代表影響很小,按 Enter 開始量)'
+            if now - st['since'] < MOTOR_ENTER_AFTER_S:
+                return '等待馬達轉動...'
+            return '沒偵測到馬達轉動。馬達確定在轉的話,代表影響很小,按 Enter 開始量'
 
         prompt = (f'安裝 2/2:讓馬達以平常的速度轉起來,偵測到會自動量 {MOTOR_RUN_S:.0f} 秒'
-                  '(Enter 立即開始 / s 略過 / q 結束):')
+                  '(s 略過 / q 結束):')
         while True:
             cmd = self._watch(prompt, status, on_packet, done)
             if cmd is None:
                 return st
             if cmd == 's':
                 return None
-            if cmd == '' and st['start'] is None:
+            if cmd != '' or st['start'] is not None:
+                continue
+            wait = MOTOR_ENTER_AFTER_S - (self._time() - st['since'])
+            if st['detected'] is None and wait > 0:
+                self._out(f'還在偵測馬達,{wait:.0f} 秒內偵測不到才能按 Enter 手動開始。')
+            else:
                 st['start'] = self._time()
 
     def _precheck_mounting(self, results, hints, accel_mean) -> None:
@@ -1246,7 +1283,8 @@ class CalibrationMenu:
             hints.append('振動大:IMU 沒有鎖緊,或太靠近馬達。鎖緊固定、靠近車體中心,'
                          '必要時加一層薄的減震墊。')
 
-    def _mag_precheck(self, report_only: bool = False, mounted: Optional[bool] = None) -> bool:
+    def _mag_precheck(self, report_only: bool = False, mounted: Optional[bool] = None,
+                      notes_choice: Optional[str] = None) -> bool:
         """
         Check the surroundings and the mounting position from the IMU's own readings.
 
@@ -1254,6 +1292,8 @@ class CalibrationMenu:
         is unsuitable the user is told why and asked twice before going on.
         ``mounted`` None asks whether the IMU is on the robot; True skips the
         question (dual-plane calibration is only used on a mounted IMU).
+        ``notes_choice`` is the menu choice whose placement notes are shown
+        again afterwards, since the check clears the screen.
         """
         if self._key_ready is None:
             self._out('(環境與安裝位置檢查需要在終端機中執行,已略過)')
@@ -1264,13 +1304,23 @@ class CalibrationMenu:
             self._verify_note(line)
         results: List[Tuple[str, str]] = []
         hints: List[str] = []
+        self._check_cal = self._load_existing()
+
+        def guarded(step, label, *args):
+            try:
+                return step(*args)
+            except ValueError as exc:
+                logger.error('environment check %s: bad data: %s', label, exc)
+                self._record(results, SKIP, f'{label}:資料異常,無法判定({exc})')
+                return None
+
         try:
-            accel_mean = self._precheck_still(results, hints)
-            self._precheck_slide(results, hints)
+            accel_mean = guarded(self._precheck_field_at_rest, '1. 磁場穩定', results, hints)
+            guarded(self._precheck_slide, '2. 附近有無鐵件', results, hints)
             if mounted is None:
                 mounted = self._confirm('IMU 已經裝在車上的最終位置了嗎?')
             if mounted:
-                self._precheck_mounting(results, hints, accel_mean)
+                guarded(self._precheck_mounting, '3–5. 安裝位置', results, hints, accel_mean)
             else:
                 self._verify_note('IMU 還沒裝上車:裝上去之後,要在最終位置重新檢查與校正。')
         except _VerifyQuit:
@@ -1285,9 +1335,14 @@ class CalibrationMenu:
             return report_only
         finally:
             self._verify_title = CHECK_TITLE
+            self._check_cal = SoftwareCalibration()
         self._out((CLEAR_SCREEN if self._color else '') + '== 環境與安裝位置 檢查結果 ==')
         for status, text in results:
             self._out(self._mark(status, text))
+        if any(text.startswith('4. 馬達干擾:') for _, text in results):
+            self._out('馬達測完了:開始校正前,先讓馬達停止。')
+        if notes_choice is not None and not report_only:
+            self._show_notes(notes_choice)
         if not any(status == FAIL for status, _ in results):
             if any(status == PASS for status, _ in results):
                 self._out(self._mark(PASS, '環境與安裝位置合適'))
@@ -1326,8 +1381,12 @@ class CalibrationMenu:
                  'gyro_turn': self._check_gyro_turn, 'mag': self._check_mag}
         try:
             for item in items:
-                steps[item](results)
-        except _VerifyQuit:
+                try:
+                    steps[item](results)
+                except ValueError as exc:
+                    logger.error('calibration check %s: bad data: %s', item, exc)
+                    self._record(results, SKIP, f'{ITEM_LABELS[item]}:資料異常,無法判定({exc})')
+        except (_VerifyQuit, KeyboardInterrupt):
             self._out('已結束檢測。')
         except (serial.SerialException, OSError) as exc:
             logger.error('reading IMU data in the calibration check failed: %s', exc)
@@ -1348,6 +1407,8 @@ class CalibrationMenu:
         else:
             self._out(f'本次已合格 {passed}/{len(CHECK_ITEMS)} 項;五項都合格才算校正良好。')
         self._step_ok = passed == len(CHECK_ITEMS)
+        if not self._step_ok:
+            self._done.discard('12')        # the latest check decides, not an earlier one
 
     def _attitude_free_view(self) -> None:
         """Show live roll / pitch / yaw / height, optionally relative to a reference."""
@@ -1429,7 +1490,8 @@ class CalibrationMenu:
         new = rsw & ~PRESS_BIT if enabled else rsw | PRESS_BIT
         action = '關閉' if enabled else '開啟'
         if not enabled:
-            self._out('開啟後每秒多 10 個封包;9600 baud 下約使用 57% 頻寬,仍足夠。')
+            self._out('開啟後每秒共 50 個封包(約 550 bytes),約佔 9600 baud(約 960 bytes/s)的 57%,'
+                      '仍足夠。')
         if not self._confirm(f'要{action}氣壓高度輸出嗎?(會寫入 IMU flash)'):
             self._out('已取消,未變更設定。')
             return

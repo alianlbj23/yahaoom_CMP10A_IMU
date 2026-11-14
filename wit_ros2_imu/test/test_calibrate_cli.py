@@ -1104,18 +1104,23 @@ def _face_stream(axis, sign, bias=(0.0, 0.0, 0.0)):
 
 
 def _mag_check_stream(dip_deg=36.0, radius=4000.0, offset=(0.0, 0.0, 0.0), n=150):
-    """Field directions all over the sphere, each with the matching gravity reading."""
+    """
+    Return data for an IMU turned so that every face has been up and down.
+
+    Gravity directions cover the whole sphere; each magnetometer reading is
+    the field at ``dip_deg`` below the horizontal for that attitude.
+    """
     dip = math.radians(dip_deg)
     out = b''
     for i in range(n):
         z = 1 - 2 * (i + 0.5) / n
         r = math.sqrt(1 - z * z)
         phi = i * math.pi * (3 - math.sqrt(5))
-        u = (r * math.cos(phi), r * math.sin(phi), z)          # field direction in the body
-        p = (-u[1], u[0], 0.0) if abs(u[2]) < 0.9 else (0.0, -u[2], u[1])
-        pn = math.sqrt(sum(c * c for c in p))
-        p = tuple(c / pn for c in p)
-        down = tuple(math.sin(dip) * a + math.cos(dip) * b for a, b in zip(u, p))
+        down = (r * math.cos(phi), r * math.sin(phi), z)     # "down" in the body frame
+        q = (-down[1], down[0], 0.0) if abs(down[2]) < 0.9 else (0.0, -down[2], down[1])
+        qn = math.sqrt(sum(c * c for c in q))
+        q = tuple(c / qn for c in q)                          # a horizontal direction
+        u = tuple(math.sin(dip) * d + math.cos(dip) * h for d, h in zip(down, q))
         out += _acc_frame(*(-G0 * d for d in down)) + STILL
         out += _mag_frame(*(round(radius * c + o) for c, o in zip(u, offset)))
     return out
@@ -1182,6 +1187,8 @@ class _Check:
             self._next_step()
         if self.key is not None:
             key, self.key = self.key, None
+            if key == '^C':
+                raise KeyboardInterrupt
             return key
         return self.menu.pop(0) if self.menu else '0'
 
@@ -1420,7 +1427,7 @@ def test_tilted_mounting_is_a_note_not_a_failure(clock, tmp_path):
     moving = _env_stream(accel=(G0 * math.sin(math.radians(10)) + 0.6, 0.0,
                                 G0 * math.cos(math.radians(10))))
     steps = [(tilted, None, 0), (_slide(tilted, tilted, moving), None, 0),
-             (STEADY, None, 0), (STEADY, '', 3.0)]        # well mounted: Enter starts the run
+             (STEADY, None, 0), (STEADY, '', 12.0)]       # well mounted: Enter starts the run
     run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'y', ''])
     assert '[注意] 3. 安裝方向:傾斜 10.0°' in run.text
     assert '環境與安裝位置合適' in run.text
@@ -1455,7 +1462,7 @@ def test_environment_check_is_skipped_off_a_terminal(clock, tmp_path):
 
 def test_dual_plane_does_not_ask_whether_the_imu_is_mounted(clock, tmp_path):
     """Option 4 exists for robots too big to flip, so the IMU is already mounted."""
-    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 3.0)]
+    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 12.0)]
     run = _Check(clock, tmp_path, steps, menu=['4', 'n'])
     assert not any('裝在車上' in p for p in run.prompts)
     assert '[合格] 3. 安裝方向' in run.text                 # mounting checks still run
@@ -1465,3 +1472,122 @@ def test_dual_plane_does_not_ask_whether_the_imu_is_mounted(clock, tmp_path):
 def test_sphere_fit_still_asks_whether_the_imu_is_mounted(clock, tmp_path):
     run = _Check(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
     assert any('裝在車上' in p for p in run.prompts)
+
+
+def test_placement_notes_are_shown_again_after_the_check(clock, tmp_path):
+    """The check clears the screen, so the notes for the option come back afterwards."""
+    run = _Check(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
+    last_clear = max(i for i, ln in enumerate(run.lines) if cli.CLEAR_SCREEN in ln)
+    after = '\n'.join(run.lines[last_clear:])
+    assert '注意事項' in after and '機器人身上會一起移動的鐵件' in after
+
+
+def test_motor_check_reminds_to_stop_the_motors(clock, tmp_path):
+    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 12.0)]
+    run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'n'])
+    assert '先讓馬達停止' in run.text
+
+
+# ------------------------------------------------- fixes from the code review
+
+def _wobble_stream(offset=(900.0, 0.0, 0.0), n=40):
+    """
+    Return data for an IMU wobbled by a few degrees around Z-up.
+
+    All three magnetometer axes move by a similar small amount, which is the
+    case where coverage measured against the data itself looks complete.
+    """
+    dip = math.radians(36.0)
+    base = (4000 * math.cos(dip) + offset[0], offset[1], -4000 * math.sin(dip) + offset[2])
+    out = b''
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        t = math.radians(4.0 * math.sin(a))
+        acc = (G0 * math.sin(t), 0.0, G0 * math.cos(t))
+        mag = (base[0] + 150 * math.cos(a), base[1] + 150 * math.sin(a),
+               base[2] + 150 * math.sin(a + 1.0))
+        out += _acc_frame(*acc) + STILL + _mag_frame(*(round(c) for c in mag))
+    return out
+
+
+def test_check_magnetometer_needs_real_turning_not_a_wobble(clock, tmp_path):
+    """Coverage comes from gravity directions, so a small wobble never completes."""
+    steps = [(None, '36', 0), (_wobble_stream(), '', 8.0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, entry='4')
+    assert '[合格] 4.' not in run.text
+    assert '[略過] 4. 磁力計 合成大小:方向涵蓋不足' in run.text
+
+
+def test_a_later_failure_removes_an_earlier_pass(clock, tmp_path, short_still):
+    steps = _good_steps() + [(None, '', 0),
+                             (_mag_check_stream(offset=(900.0, 0.0, 0.0)), None, 0),
+                             (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, menu=['12', '', '12', '4'])
+    assert '5/5 項全部合格' in run.text                        # first run
+    last = run.text.rsplit('== 檢測結果 ==', 1)[1]
+    assert '[不合格] 4. 磁力計 合成大小' in last
+    assert '全部合格' not in last
+    last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
+    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
+
+
+def test_motor_step_does_not_accept_enter_before_waiting(clock, tmp_path):
+    """Enter right away would measure the motors stopped; it is refused at first."""
+    steps = _env_steps() + [(STEADY, None, 0), (STEADY, '', 0.5), (STEADY, '', 12.0)]
+    run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'n'])
+    assert '還在偵測馬達' in run.text
+    assert '4. 馬達干擾' in run.text
+
+
+def test_check_gyro_still_restarts_when_turned_about_z(clock, tmp_path, short_still):
+    rest = STILL + _acc_frame(0, 0, G0)
+    turning = _gyro_frame(0, 0, 20.0) + _acc_frame(0, 0, G0)   # accel unchanged
+    run = _Check(clock, tmp_path, [([(0.0, rest), (2.0, turning), (2.5, rest)], 's', 3.2),
+                                   (None, 'q', 0)], entry='2')
+    assert '重新開始' in run.text
+
+
+def test_check_gyro_still_ignores_enter_while_measuring(clock, tmp_path, short_still):
+    rest = STILL + _acc_frame(0, 0, G0)
+    run = _Check(clock, tmp_path, [(rest, '', 2.5), (rest, None, 0)], entry='2')
+    assert '量測中,不用按 Enter' in run.text
+    assert '[合格] 2. 陀螺儀 靜止測試' in run.text
+
+
+def test_inclination_is_asked_every_time_with_the_last_value_offered(clock, tmp_path):
+    steps = [(None, '30', 0), (_mag_check_stream(), None, 0),
+             (None, '36', 0), (_mag_check_stream(), None, 0), (None, 'q', 0)]
+    run = _Check(clock, tmp_path, steps, menu=['12', '4', '12', '4'])
+    dip_prompts = [p for p in run.prompts if '磁傾角' in p]
+    assert len(dip_prompts) == 2
+    assert '上次 30.0' in dip_prompts[1]
+    assert '[合格] 5. 磁力計 磁傾角:量到 +36.0°,當地 +36.0°' in run.text
+
+
+def test_all_zero_magnetometer_does_not_crash_the_tool(clock, tmp_path):
+    dead = _env_stream(mag=(0, 0, 0))
+    run = _Check(clock, tmp_path, [(dead, None, 0), (None, 's', 0)], menu=['3', 'n', 'n'])
+    assert run.rc == 0
+    assert '資料異常' in run.text
+
+
+def test_ctrl_c_during_the_check_still_shows_the_results_so_far(clock, tmp_path, short_still):
+    steps = [(_face_stream(a, s), None, 0) for a, s in cc.FACES]
+    steps += [(STILL + _acc_frame(0, 0, G0), '^C', 0.5)]
+    run = _Check(clock, tmp_path, steps)
+    assert run.rc == 0
+    assert '== 檢測結果 ==' in run.text
+    tail = run.text.rsplit('== 檢測結果 ==', 1)[-1]
+    assert '[合格] 1. 加速度計 六面測試' in tail
+
+
+def test_placement_tilt_uses_the_software_calibration(clock, tmp_path):
+    """A saved accel offset is removed before the tilt is judged."""
+    cfg = tmp_path / 'c.yaml'
+    cal.save_calibration(cfg, cal.SoftwareCalibration(accel_bias=(1.7, 0.0, 0.0)))
+    leaning = _env_stream(accel=(1.7, 0.0, G0))           # raw reading ~10 deg, true 0
+    moving = _env_stream(accel=(2.3, 0.0, G0))
+    steps = [(leaning, None, 0), (_slide(leaning, leaning, moving), None, 0),
+             (leaning, None, 0), (leaning, '', 12.0)]
+    run = _Check(clock, tmp_path, steps, menu=['3', 'y', 'n'], config=cfg)
+    assert '[合格] 3. 安裝方向' in run.text
