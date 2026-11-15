@@ -21,7 +21,6 @@ import pytest
 import serial
 from wit_ros2_imu import calibrate_cli as cli
 from wit_ros2_imu import calibration as cal
-from wit_ros2_imu import calibration_check as cc
 from wit_ros2_imu import wit_protocol as wp
 
 UNLOCK = wp.cmd_unlock()
@@ -136,6 +135,13 @@ class Output:
         return '\n'.join(self.lines)
 
 
+def _after_start(ser):
+    """Return the commands sent after the mode read the tool makes once when it starts."""
+    start = wp.cmd_read(cli.REG_AXIS6)
+    assert ser.writes[:1] == [start], ser.writes[:3]
+    return ser.writes[1:]
+
+
 def run(ser, answers, clock, tmp_path, advance=0.0):
     out = Output()
     inp = scripted(answers, clock, advance)
@@ -155,7 +161,7 @@ def test_exit_immediately(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, ['0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == []
+    assert _after_start(ser) == []
     assert '11' in out.text   # menu was shown
 
 
@@ -163,7 +169,7 @@ def test_eof_on_input_exits_cleanly(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, _, _ = run(ser, [], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == []
+    assert _after_start(ser) == []
 
 
 @pytest.mark.parametrize('choice', ['abc', '14', '-1', '', '1 2'])
@@ -171,7 +177,7 @@ def test_invalid_choice_reports_and_continues(clock, tmp_path, choice):
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, [choice, '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == []
+    assert _after_start(ser) == []
     assert '無效' in out.text
 
 
@@ -182,8 +188,8 @@ def test_mag_calibration_long_rotation_reunlocks_before_normal(clock, tmp_path):
     ser = FakeSerial(clock, stream=_sphere_stream())
     rc, _, _ = run(ser, ['3', 'y', '', 'y', '0'], clock, tmp_path, advance=60.0)
     assert rc == 0
-    assert ser.writes == [UNLOCK, wp.cmd_calsw(wp.CalMode.MAG_SPHERE),
-                          UNLOCK, NORMAL, UNLOCK, SAVE]
+    assert _after_start(ser) == [UNLOCK, wp.cmd_calsw(wp.CalMode.MAG_SPHERE),
+                                 UNLOCK, NORMAL, UNLOCK, SAVE]
 
 
 def test_hardware_write_failure_is_reported(clock, tmp_path):
@@ -227,18 +233,19 @@ def test_factory_reset_requires_double_confirmation(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, _, _ = run(ser, ['11', 'y', 'n', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == []
+    assert _after_start(ser) == []
 
     ser = FakeSerial(clock)
     run(ser, ['11', 'n', '0'], clock, tmp_path)
-    assert ser.writes == []
+    assert _after_start(ser) == []
 
 
 def test_factory_reset_confirmed(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, _, _ = run(ser, ['11', 'y', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [UNLOCK, wp.cmd_factory_reset()]
+    # The algorithm is read again: factory settings may use another one.
+    assert _after_start(ser) == [UNLOCK, wp.cmd_factory_reset(), wp.cmd_read(cli.REG_AXIS6)]
 
 
 # ---------------------------------------------------------------- read offsets
@@ -252,7 +259,7 @@ def test_read_offset_registers(clock, tmp_path):
     ser = FakeSerial(clock, responses=responses)
     rc, out, _ = run(ser, ['8', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [wp.cmd_read(0x05), wp.cmd_read(0x09), wp.cmd_read(0x0D)]
+    assert _after_start(ser) == [wp.cmd_read(0x05), wp.cmd_read(0x09), wp.cmd_read(0x0D)]
     text = out.text
     for name, value in [('AXOFFSET', 1), ('AYOFFSET', 2), ('AZOFFSET', 3),
                         ('GXOFFSET', 4), ('GYOFFSET', 5), ('GZOFFSET', 6),
@@ -276,10 +283,12 @@ def test_live_view_shows_values_and_ctrl_c_returns_to_menu(clock, tmp_path):
               + make_frame(0x52, i16(0, 0, 0, 0))
               + make_frame(0x53, i16(8192, -8192, 16384, 0))
               + make_frame(0x54, i16(111, -222, 333, 2500)))
-    ser = FakeSerial(clock, stream=stream, interrupt_after=10)
+    # One read answers the mode query at start-up; Ctrl+C comes during the live view.
+    ser = FakeSerial(clock, stream=stream, interrupt_after=11,
+                     responses={wp.cmd_read(cli.REG_AXIS6): _reply(0)})
     rc, out, _ = run(ser, ['1', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == []
+    assert _after_start(ser) == []
     text = out.text
     assert 'roll' in text and 'pitch' in text and 'yaw' in text
     assert '45.00' in text and '-45.00' in text and '90.00' in text
@@ -366,7 +375,7 @@ def test_main_rejects_bad_baud(baud):
 # ---------------------------------------------------------------- placement notes
 
 MENU_HINTS = {
-    '2': '水平桌面',
+    '2': '水平的地面',
     '3': '50 cm',
     '4': '先水平、再垂直',
     '5': '靜止放置',
@@ -374,7 +383,7 @@ MENU_HINTS = {
     '7': '0 m',
     '9': '任何地方',
     '10': '寫入 IMU 設定',
-    '12': '最後一步',
+    '12': '寫入 IMU 設定',
 }
 
 
@@ -536,7 +545,7 @@ def test_mag_calibration_without_data_does_not_enter_calibration_or_save(clock, 
     rc, out, _ = run(ser, ['3', 'y', '0'], clock, tmp_path)
     assert rc == 0
     assert '未收到' in out.text
-    assert ser.writes == []
+    assert _after_start(ser) == []
 
 
 def test_mag_read_failure_restores_normal_without_save(clock, tmp_path):
@@ -613,7 +622,7 @@ def test_hardware_calibration_does_not_overwrite_a_corrupt_yaml(clock, tmp_path)
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, ['2', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == []
+    assert _after_start(ser) == []
     assert path.read_bytes() == before
     assert '格式錯誤' in out.text
 
@@ -693,119 +702,6 @@ def _angle_frame(roll_deg, pitch_deg, yaw_deg):
     return make_frame(0x53, i16(raw[0], raw[1], raw[2], 0))
 
 
-def _pressure_frame(pa, height_cm):
-    return make_frame(0x56, struct.pack('<ii', pa, height_cm))
-
-
-@pytest.mark.parametrize('value,expected', [
-    (0.0, 0.0), (190.0, -170.0), (-190.0, 170.0), (360.0, 0.0), (180.0, -180.0), (90.0, 90.0),
-])
-def test_wrap_degrees(value, expected):
-    assert cli.wrap_degrees(value) == pytest.approx(expected)
-
-
-def test_attitude_line_absolute_without_height():
-    line = cli.format_attitude((10.0, -20.5, 45.25), None)
-    assert 'roll(X)  +10.00°' in line
-    assert 'pitch(Y)  -20.50°' in line
-    assert 'yaw(Z)  +45.25°' in line
-    assert '高度 (未輸出)' in line
-
-
-def test_attitude_line_with_height():
-    line = cli.format_attitude((0.0, 0.0, 0.0), 12.34)
-    assert '高度  +12.34 m' in line
-
-
-def test_attitude_line_relative_to_reference_wraps_yaw():
-    ref = ((1.0, 2.0, 170.0), 10.0)
-    line = cli.format_attitude((1.5, 1.0, -170.0), 11.25, ref)
-    assert 'Δroll(X)   +0.50°' in line
-    assert 'Δpitch(Y)   -1.00°' in line
-    assert 'Δyaw(Z)  +20.00°' in line          # 170 -> -170 is +20, not -340
-    assert 'Δ高度   +1.25 m' in line
-
-
-@pytest.mark.parametrize('ref', [None, ((0.0, 0.0, 0.0), 0.0), ((0.0, 0.0, 0.0), None)])
-def test_attitude_line_fits_80_columns(ref):
-    line = cli.format_attitude((-179.99, -89.99, -179.99), -999.99, ref)
-    assert _display_width(line) <= 79, line
-
-
-def _attitude_stream(yaw=0.0, height_cm=1234):
-    return (_angle_frame(1.0, -2.0, yaw) + _pressure_frame(101325, height_cm))
-
-
-def _run_with_watcher(ser, clock, tmp_path, script):
-    """script: list of answers; ('wait', text) entries block until text is shown."""
-    out = Output()
-    items = list(script)
-
-    def inp(prompt=''):
-        while items and isinstance(items[0], tuple):
-            _wait_for(out, items.pop(0)[1])
-        if not items:
-            raise EOFError
-        return items.pop(0)
-    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
-                      sleep_fn=clock.sleep, time_fn=clock.time)
-    return rc, out
-
-
-def test_attitude_view_shows_live_angles_and_height_then_quits(clock, tmp_path):
-    ser = FakeSerial(clock, stream=_attitude_stream())
-    rc, out = _run_with_watcher(ser, clock, tmp_path,
-                                ['12', 'f', ('wait', '高度  +12.34 m'), 'q', '0'])
-    assert rc == 0
-    assert ser.writes == []                    # read-only
-    assert 'roll(X)   +1.00°' in out.text
-    assert 'pitch(Y)   -2.00°' in out.text
-
-
-def test_attitude_view_enter_sets_reference_and_r_clears_it(clock, tmp_path):
-    ser = FakeSerial(clock, stream=_attitude_stream(yaw=30.0))
-    rc, out = _run_with_watcher(ser, clock, tmp_path, [
-        '12', 'f', ('wait', 'yaw(Z)  +30.00°'), '', ('wait', 'Δyaw(Z)   +0.00°'), 'r',
-        'q', '0'])
-    assert rc == 0
-    assert '參考點已設定' in out.text
-    assert '已清除參考點' in out.text
-    assert ser.writes == []
-
-
-def test_attitude_view_reference_needs_data(clock, tmp_path):
-    ser = FakeSerial(clock)                      # no data at all
-    rc, out = _run_with_watcher(ser, clock, tmp_path, ['12', 'f', '', 'q', '0'])
-    assert rc == 0
-    assert '尚未收到角度資料' in out.text
-
-
-def test_option_12_offers_the_calibration_check(clock, tmp_path):
-    """The entry prompt offers the full check, single checks and the free view."""
-    ser = FakeSerial(clock)
-    rc, out, inp = run(ser, ['12', 'q', '0'], clock, tmp_path)
-    prompt = ' '.join(inp.prompts)
-    assert '完整檢測' in prompt and '1 加速度計' in prompt and 'f = 姿態檢視' in prompt
-
-
-def test_attitude_view_ctrl_c_returns_to_menu(clock, tmp_path):
-    ser = FakeSerial(clock, stream=_attitude_stream())
-    calls = {'n': 0}
-    out = Output()
-
-    def inp(prompt=''):
-        calls['n'] += 1
-        if calls['n'] == 1:
-            return '12'
-        if calls['n'] == 2:
-            raise KeyboardInterrupt
-        return '0'
-    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
-                      sleep_fn=clock.sleep, time_fn=clock.time)
-    assert rc == 0
-    assert ser.writes == []
-
-
 def test_attitude_view_serial_error_is_reported(clock, tmp_path):
     class Broken(FakeSerial):
 
@@ -827,18 +723,18 @@ def _rsw_reply(rsw):
 def test_enable_pressure_output_sets_rsw_bit_and_saves(clock, tmp_path):
     read_rsw = wp.cmd_read(0x02)
     ser = FakeSerial(clock, responses={read_rsw: _rsw_reply(0x001E)})
-    rc, out, _ = run(ser, ['13', 'y', '0'], clock, tmp_path)
+    rc, out, _ = run(ser, ['12', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [read_rsw, UNLOCK, wp.cmd_write(0x02, 0x005E), SAVE]
+    assert _after_start(ser) == [read_rsw, UNLOCK, wp.cmd_write(0x02, 0x005E), SAVE]
     assert '已開啟' in out.text
 
 
 def test_disable_pressure_output_clears_rsw_bit(clock, tmp_path):
     read_rsw = wp.cmd_read(0x02)
     ser = FakeSerial(clock, responses={read_rsw: _rsw_reply(0x005E)})
-    rc, out, _ = run(ser, ['13', 'y', '0'], clock, tmp_path)
+    rc, out, _ = run(ser, ['12', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [read_rsw, UNLOCK, wp.cmd_write(0x02, 0x001E), SAVE]
+    assert _after_start(ser) == [read_rsw, UNLOCK, wp.cmd_write(0x02, 0x001E), SAVE]
     assert '已關閉' in out.text
 
 
@@ -846,17 +742,17 @@ def test_disable_pressure_output_clears_rsw_bit(clock, tmp_path):
 def test_pressure_output_toggle_declined_only_reads(clock, tmp_path, answer):
     read_rsw = wp.cmd_read(0x02)
     ser = FakeSerial(clock, responses={read_rsw: _rsw_reply(0x001E)})
-    rc, out, _ = run(ser, ['13', answer, '0'], clock, tmp_path)
+    rc, out, _ = run(ser, ['12', answer, '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [read_rsw]
+    assert _after_start(ser) == [read_rsw]
     assert '未開啟' in out.text                  # current state is shown
 
 
 def test_pressure_output_toggle_read_timeout_writes_nothing(clock, tmp_path):
     ser = FakeSerial(clock)                      # never answers the register read
-    rc, out, _ = run(ser, ['13', 'y', '0'], clock, tmp_path)
+    rc, out, _ = run(ser, ['12', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [wp.cmd_read(0x02)]
+    assert _after_start(ser) == [wp.cmd_read(0x02)]
     assert '逾時' in out.text
 
 
@@ -867,7 +763,7 @@ def test_height_zero_notes_mention_pressure_output_disabled():
 
 
 def test_height_zero_notes_point_to_pressure_toggle():
-    assert any('13' in line for line in cli.NOTES['7'])
+    assert any('12' in line for line in cli.NOTES['7'])
 
 
 def test_use_color_only_on_a_tty_without_no_color():
@@ -887,25 +783,6 @@ def test_use_color_only_on_a_tty_without_no_color():
 
 
 # --------------------------------------------- in-place updates on a terminal
-
-def test_free_view_keeps_one_line_when_reference_is_set_on_a_terminal(clock, tmp_path):
-    """On a terminal Enter must not leave a 'reference set' line behind."""
-    ser = FakeSerial(clock, stream=_attitude_stream(yaw=30.0))
-    out = Output()
-    items = ['12', 'f', ('wait', 'yaw(Z)  +30.00°'), '', ('wait', 'Δyaw(Z)   +0.00°'), 'q', '0']
-
-    def inp(prompt=''):
-        while items and isinstance(items[0], tuple):
-            _wait_for(out, items.pop(0)[1])
-        if not items:
-            raise EOFError
-        return items.pop(0)
-    rc = cli.run_menu(ser, inp, out, tmp_path / 'c.yaml',
-                      sleep_fn=clock.sleep, time_fn=clock.time, color=True)
-    assert rc == 0
-    assert '參考點已設定' not in out.text
-    assert cli.CURSOR_UP_CLEAR in out.text          # the Enter newline is taken back
-
 
 # ------------------------------------ menu marks steps done in this session
 
@@ -994,35 +871,6 @@ def _acc_frame(x, y, z):
 STILL = _gyro_frame(0.0, 0.0, 0.0)
 
 
-def _face_stream(axis, sign, bias=(0.0, 0.0, 0.0)):
-    v = [0.0, 0.0, 0.0]
-    v[cc.axis_index(axis)] = sign * G0
-    return _acc_frame(*(a + b for a, b in zip(v, bias))) + STILL
-
-
-def _mag_check_stream(dip_deg=36.0, radius=4000.0, offset=(0.0, 0.0, 0.0), n=150):
-    """
-    Return data for an IMU turned so that every face has been up and down.
-
-    Gravity directions cover the whole sphere; each magnetometer reading is
-    the field at ``dip_deg`` below the horizontal for that attitude.
-    """
-    dip = math.radians(dip_deg)
-    out = b''
-    for i in range(n):
-        z = 1 - 2 * (i + 0.5) / n
-        r = math.sqrt(1 - z * z)
-        phi = i * math.pi * (3 - math.sqrt(5))
-        down = (r * math.cos(phi), r * math.sin(phi), z)     # "down" in the body frame
-        q = (-down[1], down[0], 0.0) if abs(down[2]) < 0.9 else (0.0, -down[2], down[1])
-        qn = math.sqrt(sum(c * c for c in q))
-        q = tuple(c / qn for c in q)                          # a horizontal direction
-        u = tuple(math.sin(dip) * d + math.cos(dip) * h for d, h in zip(down, q))
-        out += _acc_frame(*(-G0 * d for d in down)) + STILL
-        out += _mag_frame(*(round(radius * c + o) for c, o in zip(u, offset)))
-    return out
-
-
 class _Check:
     """
     Run option 12 on a fake terminal.
@@ -1080,8 +928,6 @@ class _Check:
 
     def _input(self, prompt=''):
         self.prompts.append(prompt)
-        if '磁傾角' in prompt and self.steps:
-            self._next_step()
         if self.key is not None:
             key, self.key = self.key, None
             if key == '^C':
@@ -1092,131 +938,6 @@ class _Check:
     @property
     def text(self):
         return '\n'.join(self.lines)
-
-
-def _good_steps(dip_answer='36'):
-    faces = [(_face_stream(a, s), None, 0) for a, s in cc.FACES]
-    return faces + [
-        (STILL + _acc_frame(0, 0, G0), None, 0),                     # gyro at rest
-        (STILL + _acc_frame(0, 0, G0), '', 0),                       # align with the line
-        (_gyro_frame(0, 0, 36.0) + _acc_frame(0, 0, G0), '', 10.05),  # one turn in 10 s
-        (None, dip_answer, 0),                                       # local inclination
-        (_mag_check_stream(), None, 0),                              # magnetometer
-    ]
-
-
-@pytest.fixture
-def short_still(monkeypatch):
-    """Shorten the 5 minute static gyro test for the unit tests."""
-    monkeypatch.setattr(cli, 'GYRO_STILL_S', 3.0)
-
-
-def test_check_passes_a_good_imu_and_marks_option_12(clock, tmp_path, short_still):
-    run = _Check(clock, tmp_path, _good_steps())
-    assert run.rc == 0
-    for item in ('1. 加速度計', '2. 陀螺儀 靜止', '3. 陀螺儀 轉一圈', '4. 磁力計 合成大小',
-                 '5. 磁力計 磁傾角'):
-        assert f'[合格] {item}' in run.text, item
-    assert '5/5 項全部合格' in run.text
-    last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
-    assert cli.DONE_MARK in _menu_row(last_menu, 12)
-    assert run.ser.writes == []                                      # read-only
-
-
-def test_check_finds_an_accelerometer_offset(clock, tmp_path, short_still):
-    steps = [(_face_stream(a, s, bias=(0.3, 0.0, 0.0)), None, 0) for a, s in cc.FACES]
-    run = _Check(clock, tmp_path, steps + [(None, 'q', 0)])
-    assert '[不合格] 1. 加速度計 六面測試' in run.text
-    assert '偏移 X +0.30' in run.text
-
-
-def test_check_finds_a_gyro_bias(clock, tmp_path, short_still):
-    steps = [(_gyro_frame(0, 0, 0.13) + _acc_frame(0, 0, G0), None, 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='2')
-    assert '[不合格] 2. 陀螺儀 靜止測試' in run.text
-    assert 'Z +0.12' in run.text
-
-
-def test_check_applies_the_software_calibration(clock, tmp_path, short_still):
-    """With the bias saved by option 9, the same gyro output passes."""
-    raw_z = _gyro_frame(0, 0, 0.13)
-    z_rad = wp.decode_frame(raw_z).z
-    cfg = tmp_path / 'c.yaml'
-    cal.save_calibration(cfg, cal.SoftwareCalibration(gyro_bias=(0.0, 0.0, z_rad)))
-    steps = [(raw_z + _acc_frame(0, 0, G0), None, 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='2', config=cfg)
-    assert '已套用軟體校正' in run.text
-    assert '[合格] 2. 陀螺儀 靜止測試' in run.text
-
-
-def test_check_gyro_still_restarts_when_moved(clock, tmp_path, short_still):
-    moving = STILL + _acc_frame(0, 0, G0) + STILL + _acc_frame(2.0, 0, G0)
-    run = _Check(clock, tmp_path, [(moving, 's', 6.0), (None, 'q', 0)], entry='2')
-    assert '重新開始' in run.text
-    assert '[略過] 2. 陀螺儀 靜止測試' in run.text
-
-
-def test_check_full_turn_fails_when_the_gyro_reads_short(clock, tmp_path):
-    steps = [(STILL, '', 0), (_gyro_frame(0, 0, 30.0), '', 10.05), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='3')
-    assert '[不合格] 3. 陀螺儀 轉一圈測試' in run.text
-    assert '已轉' in run.text                         # live angle while turning
-
-
-def test_check_magnetometer_detects_hard_iron(clock, tmp_path):
-    """
-    A hard-iron offset is caught by the magnitude test.
-
-    Averaged over every direction the offset cancels in the mean dip angle,
-    so the dip test cannot see it; that is why both tests are needed.
-    """
-    steps = [(None, '36', 0), (_mag_check_stream(offset=(900.0, 0.0, 0.0)), None, 0),
-             (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='4')
-    assert '[不合格] 4. 磁力計 合成大小' in run.text
-
-
-def test_check_magnetometer_compares_with_the_entered_inclination(clock, tmp_path):
-    steps = [(None, '30', 0), (_mag_check_stream(dip_deg=36.0), None, 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='4')
-    assert '[合格] 4. 磁力計 合成大小' in run.text
-    assert '[不合格] 5. 磁力計 磁傾角:量到 +36.0°,當地 +30.0°' in run.text
-
-
-def test_check_dip_is_skipped_without_an_inclination(clock, tmp_path):
-    steps = [(None, '', 0), (_mag_check_stream(), None, 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='4')
-    assert '[略過] 5. 磁力計 磁傾角:未輸入當地磁傾角' in run.text
-    assert 'ngdc.noaa.gov' in run.text
-
-
-def test_check_rejects_an_invalid_inclination(clock, tmp_path):
-    steps = [(None, '95', 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='4')
-    assert '-90 到 90' in run.text
-
-
-def test_check_shows_which_face_is_up(clock, tmp_path):
-    steps = [(_face_stream('X', +1), 's', 3.0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='1')
-    assert '目前:X 軸朝上,請改成 Z 軸朝上' in run.text
-    assert '[略過] 1. 加速度計 六面測試' in run.text
-
-
-def test_check_single_item_does_not_mark_option_12(clock, tmp_path):
-    steps = [(_face_stream(a, s), None, 0) for a, s in cc.FACES] + [(None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='1')
-    assert '[合格] 1. 加速度計 六面測試' in run.text
-    assert '本次已合格 1/5 項' in run.text
-    last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
-    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
-
-
-def test_check_needs_a_terminal(clock, tmp_path):
-    ser = FakeSerial(clock)
-    rc, out, _ = run(ser, ['12', '', '0'], clock, tmp_path)
-    assert '需要在終端機中執行' in out.text
-    assert ser.writes == []
 
 
 # ------------------------ environment / mounting check before a mag calibration
@@ -1260,7 +981,7 @@ def test_unsuitable_place_is_explained_and_can_be_cancelled(clock, tmp_path):
     assert '[不合格] 1. 磁場穩定' in run.text
     assert '附近有馬達在轉' in run.text
     assert '已取消校正,未送出任何指令' in run.text
-    assert run.ser.writes == []
+    assert _after_start(run.ser) == []
 
 
 def test_unsuitable_place_asks_a_second_time(clock, tmp_path):
@@ -1270,7 +991,7 @@ def test_unsuitable_place_asks_a_second_time(clock, tmp_path):
     assert any('仍要在這裡繼續校正' in p for p in run.prompts)
     assert any('再確認一次' in p for p in run.prompts)
     assert '已取消校正' in run.text
-    assert run.ser.writes == []
+    assert _after_start(run.ser) == []
 
 
 def test_user_who_insists_twice_gets_the_calibration(clock, tmp_path):
@@ -1349,7 +1070,7 @@ def test_mounting_position_near_motors_is_reported(clock, tmp_path):
     assert '[不合格] 4. 馬達干擾' in run.text
     assert '[不合格] 5. 振動' in run.text
     assert '離馬達或電源線太近' in run.text
-    assert run.ser.writes == []
+    assert _after_start(run.ser) == []
 
 
 def test_tilted_mounting_is_a_note_not_a_failure(clock, tmp_path):
@@ -1365,17 +1086,10 @@ def test_tilted_mounting_is_a_note_not_a_failure(clock, tmp_path):
     assert MAG_SPHERE_CMD in run.ser.writes
 
 
-def test_option_12_can_check_the_place_without_calibrating(clock, tmp_path):
-    run = _Check(clock, tmp_path, _env_steps(end=NEAR_IRON_END), menu=['12', '5', 'n'])
-    assert '[不合格] 2. 附近有無鐵件' in run.text
-    assert not any('仍要在這裡繼續校正' in p for p in run.prompts)
-    assert run.ser.writes == []
-
-
 def test_quitting_the_check_cancels_the_calibration(clock, tmp_path):
     run = _Check(clock, tmp_path, [(STEADY, 'q', 0.5)], menu=['3'])
     assert '已取消校正' in run.text
-    assert run.ser.writes == []
+    assert _after_start(run.ser) == []
 
 
 def test_environment_check_is_skipped_off_a_terminal(clock, tmp_path):
@@ -1414,85 +1128,11 @@ def test_motor_check_reminds_to_stop_the_motors(clock, tmp_path):
 
 # ------------------------------------------------- fixes from the code review
 
-def _wobble_stream(offset=(900.0, 0.0, 0.0), n=40):
-    """
-    Return data for an IMU wobbled by a few degrees around Z-up.
-
-    All three magnetometer axes move by a similar small amount, which is the
-    case where coverage measured against the data itself looks complete.
-    """
-    dip = math.radians(36.0)
-    base = (4000 * math.cos(dip) + offset[0], offset[1], -4000 * math.sin(dip) + offset[2])
-    out = b''
-    for i in range(n):
-        a = 2 * math.pi * i / n
-        t = math.radians(4.0 * math.sin(a))
-        acc = (G0 * math.sin(t), 0.0, G0 * math.cos(t))
-        mag = (base[0] + 150 * math.cos(a), base[1] + 150 * math.sin(a),
-               base[2] + 150 * math.sin(a + 1.0))
-        out += _acc_frame(*acc) + STILL + _mag_frame(*(round(c) for c in mag))
-    return out
-
-
-def test_check_magnetometer_needs_real_turning_not_a_wobble(clock, tmp_path):
-    """Coverage comes from gravity directions, so a small wobble never completes."""
-    steps = [(None, '36', 0), (_wobble_stream(), '', 8.0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, entry='4')
-    assert '[合格] 4.' not in run.text
-    assert '[略過] 4. 磁力計 合成大小:方向涵蓋不足' in run.text
-
-
-def test_a_later_failure_removes_an_earlier_pass(clock, tmp_path, short_still):
-    steps = _good_steps() + [(None, '', 0),
-                             (_mag_check_stream(offset=(900.0, 0.0, 0.0)), None, 0),
-                             (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, menu=['12', '', '', '12', '4'])   # '' = back to menu
-    assert '5/5 項全部合格' in run.text                        # first run
-    last = run.text.rsplit('== 檢測結果 ==', 1)[1]
-    assert '[不合格] 4. 磁力計 合成大小' in last
-    assert '全部合格' not in last
-    last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
-    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
-
-
-def test_skipping_a_repeated_check_revokes_its_previous_pass(clock, tmp_path, short_still):
-    """A skipped retest must not silently reuse its old green result."""
-    steps = _good_steps() + [(None, '', 0), (STEADY, 's', 0.1), (None, 'q', 0)]
-    result = _Check(clock, tmp_path, steps, menu=['12', '', '', '12', '4'])
-    assert '5/5 項全部合格' in result.text
-    last = result.text.rsplit('== 檢測結果 ==', 1)[-1]
-    assert '5/5 項全部合格' not in last
-    last_menu = [line for line in result.lines if 'CMP10A IMU 校正工具' in line][-1]
-    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
-
-
-@pytest.mark.parametrize('choice,stream,answers', [
-    ('2', b'', ['y']),
-])
-def test_calibration_changes_invalidate_previous_verification(clock, tmp_path,
-                                                              choice, stream, answers):
-    menu = cli.CalibrationMenu(FakeSerial(clock, stream=stream), scripted(answers), Output(),
-                               tmp_path / 'c.yaml', sleep_fn=clock.sleep, time_fn=clock.time)
-    menu._check_passed.update(cli.CHECK_ITEMS)
-    menu._done.add('12')
-    menu._actions[choice]()
-    assert not menu._check_passed
-    assert '12' not in menu._done
-
-
 def test_skipped_environment_step_is_not_reported_as_suitable(clock, tmp_path):
     result = _Check(clock, tmp_path, [(STEADY, None, 0), (STEADY, 's', 0.1)],
                     menu=['3', 'n', 'n'])
     assert '環境與安裝位置合適' not in result.text
     assert '檢查未完成' in result.text
-
-
-def test_interrupted_full_retest_cannot_reuse_unvisited_results(clock, tmp_path, short_still):
-    steps = _good_steps() + [(STEADY, 'q', 0.1)]
-    result = _Check(clock, tmp_path, steps, menu=['12', '', '', '12', ''])
-    assert '5/5 項全部合格' in result.text
-    last_menu = [line for line in result.lines if 'CMP10A IMU 校正工具' in line][-1]
-    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
 
 
 def test_motor_step_does_not_accept_enter_before_waiting(clock, tmp_path):
@@ -1503,46 +1143,11 @@ def test_motor_step_does_not_accept_enter_before_waiting(clock, tmp_path):
     assert '4. 馬達干擾' in run.text
 
 
-def test_check_gyro_still_restarts_when_turned_about_z(clock, tmp_path, short_still):
-    rest = STILL + _acc_frame(0, 0, G0)
-    turning = _gyro_frame(0, 0, 20.0) + _acc_frame(0, 0, G0)   # accel unchanged
-    run = _Check(clock, tmp_path, [([(0.0, rest), (2.0, turning), (2.5, rest)], 's', 3.2),
-                                   (None, 'q', 0)], entry='2')
-    assert '重新開始' in run.text
-
-
-def test_check_gyro_still_ignores_enter_while_measuring(clock, tmp_path, short_still):
-    rest = STILL + _acc_frame(0, 0, G0)
-    run = _Check(clock, tmp_path, [(rest, '', 2.5), (rest, None, 0)], entry='2')
-    assert '量測中,不用按 Enter' in run.text
-    assert '[合格] 2. 陀螺儀 靜止測試' in run.text
-
-
-def test_inclination_is_asked_every_time_with_the_last_value_offered(clock, tmp_path):
-    steps = [(None, '30', 0), (_mag_check_stream(), None, 0),
-             (None, '36', 0), (_mag_check_stream(), None, 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, menu=['12', '4', '', '12', '4'])
-    dip_prompts = [p for p in run.prompts if '磁傾角' in p]
-    assert len(dip_prompts) == 2
-    assert '上次 30.0' in dip_prompts[1]
-    assert '[合格] 5. 磁力計 磁傾角:量到 +36.0°,當地 +36.0°' in run.text
-
-
 def test_all_zero_magnetometer_does_not_crash_the_tool(clock, tmp_path):
     dead = _env_stream(mag=(0, 0, 0))
     run = _Check(clock, tmp_path, [(dead, None, 0), (None, 's', 0)], menu=['3', 'n', 'n'])
     assert run.rc == 0
     assert '資料異常' in run.text
-
-
-def test_ctrl_c_during_the_check_still_shows_the_results_so_far(clock, tmp_path, short_still):
-    steps = [(_face_stream(a, s), None, 0) for a, s in cc.FACES]
-    steps += [(STILL + _acc_frame(0, 0, G0), '^C', 0.5)]
-    run = _Check(clock, tmp_path, steps)
-    assert run.rc == 0
-    assert '== 檢測結果 ==' in run.text
-    tail = run.text.rsplit('== 檢測結果 ==', 1)[-1]
-    assert '[合格] 1. 加速度計 六面測試' in tail
 
 
 def test_placement_tilt_uses_the_software_calibration(clock, tmp_path):
@@ -1576,8 +1181,8 @@ def test_accel_calibration_holds_still_for_the_official_time(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, ['2', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [UNLOCK, wp.cmd_calsw(wp.CalMode.ACCEL), NORMAL, SAVE]
-    t_cal, t_normal = ser.write_times[1], ser.write_times[2]
+    assert _after_start(ser) == [UNLOCK, wp.cmd_calsw(wp.CalMode.ACCEL), NORMAL, SAVE]
+    t_cal, t_normal = ser.write_times[2], ser.write_times[3]     # after the start-up mode read
     assert t_normal - t_cal >= cli.ACCEL_CAL_WAIT == 2.0
     assert '水平' in out.text
 
@@ -1593,11 +1198,21 @@ def test_accel_calibration_shows_the_readings_to_expect(clock, tmp_path):
     assert '0、0、1 g' in out.text
 
 
+class _LateNineAxisSerial(FakeSerial):
+    """No reply to the start-up mode read; nine-axis from the next read on."""
+
+    def write(self, data):
+        if bytes(data) == READ_AXIS6 and READ_AXIS6 in self.writes:
+            self.responses = {READ_AXIS6: _reply(0)}
+        return super().write(data)
+
+
 def test_heading_zero_is_refused_in_nine_axis_mode(clock, tmp_path):
-    ser = FakeSerial(clock, responses={READ_AXIS6: _reply(0)})
+    # The menu could not tell the mode, so 5 is listed; the step itself checks again.
+    ser = _LateNineAxisSerial(clock)
     rc, out, _ = run(ser, ['5', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [READ_AXIS6]
+    assert _after_start(ser) == [READ_AXIS6]
     assert '九軸' in out.text and '不能歸零' in out.text
     assert '選項 10' in out.text
 
@@ -1605,8 +1220,8 @@ def test_heading_zero_is_refused_in_nine_axis_mode(clock, tmp_path):
 def test_heading_zero_runs_in_six_axis_mode(clock, tmp_path):
     ser = FakeSerial(clock, responses={READ_AXIS6: _reply(1)})
     rc, out, _ = run(ser, ['5', 'y', '0'], clock, tmp_path)
-    assert ser.writes == [READ_AXIS6, UNLOCK, wp.cmd_calsw(wp.CalMode.HEADING_ZERO),
-                          NORMAL, SAVE]
+    assert _after_start(ser) == [READ_AXIS6, UNLOCK, wp.cmd_calsw(wp.CalMode.HEADING_ZERO),
+                                 NORMAL, SAVE]
     assert '100%' in out.text
 
 
@@ -1621,16 +1236,16 @@ def test_angle_reference_shows_the_official_warning_first(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, out, inp = run(ser, ['6', 'n', '0'], clock, tmp_path)
     assert any('官方警告' in p for p in inp.prompts)
-    assert ser.writes == []
+    assert _after_start(ser) == []
     ser = FakeSerial(clock)
     rc, out, inp = run(ser, ['6', 'y', 'y', '0'], clock, tmp_path)
-    assert ser.writes == [UNLOCK, wp.cmd_calsw(wp.CalMode.ANGLE_REF), NORMAL, SAVE]
+    assert _after_start(ser) == [UNLOCK, wp.cmd_calsw(wp.CalMode.ANGLE_REF), NORMAL, SAVE]
 
 
 def test_height_zero_sends_the_command(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, ['7', 'y', '0'], clock, tmp_path)
-    assert ser.writes == [UNLOCK, wp.cmd_calsw(wp.CalMode.HEIGHT_ZERO), NORMAL, SAVE]
+    assert _after_start(ser) == [UNLOCK, wp.cmd_calsw(wp.CalMode.HEIGHT_ZERO), NORMAL, SAVE]
     assert '100%' in out.text
 
 
@@ -1649,7 +1264,7 @@ def test_mag_calibration_waits_for_enter(clock, tmp_path):
     ser = FakeSerial(clock, stream=_sphere_stream())
     rc, out, inp = run(ser, ['3', 'y', '', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert ser.writes == [UNLOCK, wp.cmd_calsw(wp.CalMode.MAG_SPHERE), NORMAL, SAVE]
+    assert _after_start(ser) == [UNLOCK, wp.cmd_calsw(wp.CalMode.MAG_SPHERE), NORMAL, SAVE]
     assert '平面' in out.text and '南北' in out.text
     assert any('Enter' in p for p in inp.prompts)
 
@@ -1665,7 +1280,7 @@ def test_mag_calibration_progress_uses_magnetometer_with_frozen_gyro(clock, tmp_
     ser = FakeSerial(clock, stream=_sphere_stream())
     rc, out = _run_mag_waiting_for(ser, clock, tmp_path, choice, '[完成] 按 Enter')
     assert rc == 0
-    assert ser.writes[:2] == [UNLOCK, wp.cmd_calsw(mode)]
+    assert _after_start(ser)[:2] == [UNLOCK, wp.cmd_calsw(mode)]
     assert ser.writes[-2:] == [NORMAL, SAVE]
     assert '尚未轉完' not in out.text
 
@@ -1696,7 +1311,7 @@ def test_dual_plane_will_not_start_when_tilted_over_15_degrees(clock, tmp_path):
     rc, out, inp = run(ser, ['4', 'y', 'q', '0'], clock, tmp_path)
     assert rc == 0
     assert any('不可超過 15°' in p for p in inp.prompts)
-    assert ser.writes == []                                  # nothing sent
+    assert _after_start(ser) == []                                  # nothing sent
 
 
 def test_mag_calibration_explains_which_rotation_fixes_each_plane(clock, tmp_path):
@@ -1727,7 +1342,7 @@ def test_partial_mag_save_requires_confirmation_and_is_not_marked_done(clock, tm
 def test_gyro_auto_calibration_status_is_read_only(clock, tmp_path):
     ser = FakeSerial(clock, responses={READ_GYROCAL: _reply(50, 0, 1000, 0)})
     rc, out, _ = run(ser, ['9', '0'], clock, tmp_path)
-    assert ser.writes == [READ_GYROCAL]
+    assert _after_start(ser) == [READ_GYROCAL]
     assert '0.050°/s' in out.text and '1000 ms' in out.text
     assert '預設' in out.text and '等速旋轉' in out.text
 
@@ -1736,7 +1351,7 @@ def test_gyro_auto_calibration_status_without_reply(clock, tmp_path):
     ser = FakeSerial(clock)
     rc, out, _ = run(ser, ['9', '0'], clock, tmp_path)
     assert '逾時' in out.text
-    assert ser.writes == [READ_GYROCAL]
+    assert _after_start(ser) == [READ_GYROCAL]
 
 
 class _AlgorithmSerial(FakeSerial):
@@ -1757,7 +1372,8 @@ class _AlgorithmSerial(FakeSerial):
 def test_switch_to_six_axis_writes_and_reads_back(clock, tmp_path):
     ser = _AlgorithmSerial(clock, axis6=0)
     rc, out, _ = run(ser, ['10', 'y', '0'], clock, tmp_path)
-    assert ser.writes == [READ_AXIS6, UNLOCK, wp.cmd_write(cli.REG_AXIS6, 1), SAVE, READ_AXIS6]
+    assert _after_start(ser) == [READ_AXIS6, UNLOCK, wp.cmd_write(cli.REG_AXIS6, 1), SAVE,
+                                 READ_AXIS6]
     assert '已切換為六軸' in out.text
     assert 'Z 軸歸零(5)' in out.text
     assert cli.DONE_MARK in _menu_row(_menu_blocks(out)[-1], 10)
@@ -1767,7 +1383,7 @@ def test_switch_algorithm_declined_only_reads(clock, tmp_path):
     ser = _AlgorithmSerial(clock, axis6=1)
     rc, out, _ = run(ser, ['10', 'n', '0'], clock, tmp_path)
     assert '目前:六軸' in out.text
-    assert ser.writes == [READ_AXIS6]
+    assert _after_start(ser) == [READ_AXIS6]
 
 
 def test_switch_algorithm_reports_an_unconfirmed_change(clock, tmp_path):
@@ -1782,7 +1398,7 @@ def test_notes_follow_the_official_manual():
     assert any('50 cm' in n for n in cli.NOTES['3'])
     assert any('六軸' in n for n in cli.NOTES['5'])
     assert any('官方警告' in n for n in cli.NOTES['6'])
-    assert any('選項 13' in n for n in cli.NOTES['7'])
+    assert any('選項 12' in n for n in cli.NOTES['7'])
 
 
 # --------------------------------------- results stay on screen until Enter
@@ -1795,37 +1411,69 @@ class _LoggedCheck(_Check):
         return super()._input(prompt)
 
 
-MENU_TITLE = '========== CMP10A IMU 校正工具 =========='
-
-
-def _prompt_before_next_menu(run, header):
-    """Return the first prompt after the last ``header`` line, if it comes before the menu."""
-    start = max(i for i, ln in enumerate(run.lines) if header in ln)
-    for ln in run.lines[start:]:
-        if MENU_TITLE in ln:
-            return None
-        if ln.startswith('<PROMPT>'):
-            return ln
-    return None
-
-
-def test_check_results_wait_for_enter_before_the_menu(clock, tmp_path):
-    """Regression: the menu came right after the results and pushed them off the screen."""
-    steps = [(STILL, '', 0), (_gyro_frame(0, 0, 30.0), '', 10.05)]
-    run = _LoggedCheck(clock, tmp_path, steps, entry='3')
-    assert '[不合格] 3. 陀螺儀 轉一圈測試' in run.text
-    prompt = _prompt_before_next_menu(run, '== 檢測結果 ==')
-    assert prompt is not None and '按 Enter 返回選單' in prompt
-
-
-def test_environment_report_waits_for_enter_before_the_menu(clock, tmp_path):
-    run = _LoggedCheck(clock, tmp_path, _env_steps(), menu=['12', '5', 'n'])
-    assert '[合格] 2. 附近有無鐵件' in run.text
-    prompt = _prompt_before_next_menu(run, '== 環境與安裝位置 檢查結果 ==')
-    assert prompt is not None and '按 Enter 返回選單' in prompt
-
-
 def test_environment_check_before_a_calibration_does_not_pause(clock, tmp_path):
     """Before a calibration the results lead straight into it; no extra Enter."""
     run = _LoggedCheck(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
     assert not any('返回選單' in p for p in run.prompts)
+
+
+# ------------------------------------------- menu follows the six / nine-axis mode
+
+def _menu_numbers(block):
+    green = cli.ANSI_COLOURS[cli.PASS]
+    rows = (ln.replace(green, '').strip() for ln in block.splitlines())
+    return {r.split('.')[0] for r in rows if r[:1].isdigit() and '.' in r}
+
+
+def test_six_axis_menu_hides_the_magnetometer_calibrations(clock, tmp_path):
+    ser = FakeSerial(clock, responses={READ_AXIS6: _reply(1)})
+    rc, out, _ = run(ser, ['3', '4', '0'], clock, tmp_path)
+    assert rc == 0
+    menu = _menu_blocks(out)[0]
+    assert '目前:六軸' in menu
+    assert _menu_numbers(menu) == {str(n) for n in range(13)} - {'3', '4'}
+    assert '3、4 磁力計校正:六軸用不到,已隱藏' in menu
+    assert out.text.count('目前是六軸') == 2           # 3 and 4 typed anyway
+    assert _after_start(ser) == []                    # nothing sent for them
+
+
+def test_nine_axis_menu_hides_heading_zero(clock, tmp_path):
+    ser = FakeSerial(clock, responses={READ_AXIS6: _reply(0)})
+    rc, out, _ = run(ser, ['5', '0'], clock, tmp_path)
+    assert rc == 0
+    menu = _menu_blocks(out)[0]
+    assert '目前:九軸' in menu
+    assert _menu_numbers(menu) == {str(n) for n in range(13)} - {'5'}
+    assert '目前是九軸' in out.text and '選 10' in out.text
+    assert _after_start(ser) == []
+
+
+def test_unknown_mode_lists_every_option(clock, tmp_path):
+    ser = FakeSerial(clock)                            # no reply to the mode read
+    rc, out, _ = run(ser, ['0'], clock, tmp_path)
+    menu = _menu_blocks(out)[0]
+    assert '模式未知' in menu and '讀不到演算法設定,全部列出' in menu
+    assert _menu_numbers(menu) == {str(n) for n in range(13)}
+
+
+def test_menu_follows_an_algorithm_switch(clock, tmp_path):
+    ser = _AlgorithmSerial(clock, axis6=0)
+    rc, out, _ = run(ser, ['10', 'y', '0'], clock, tmp_path)
+    first, last = _menu_blocks(out)[0], _menu_blocks(out)[-1]
+    assert '3' in _menu_numbers(first) and '5' not in _menu_numbers(first)
+    assert '目前:六軸' in last
+    assert '5' in _menu_numbers(last) and '3' not in _menu_numbers(last)
+
+
+def test_mode_read_failure_at_start_still_shows_the_menu(clock, tmp_path):
+    ser = FakeSerial(clock, fail_write=True)
+    rc, out, _ = run(ser, ['0'], clock, tmp_path)
+    assert rc == 0
+    assert '模式未知' in _menu_blocks(out)[0]
+
+
+def test_ctrl_c_during_the_mode_read_exits_cleanly(clock, tmp_path):
+    ser = FakeSerial(clock, interrupt_after=0)
+    rc, out, _ = run(ser, ['0'], clock, tmp_path)
+    assert rc == 130
+    assert '已中斷' in out.text

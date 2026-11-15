@@ -2,7 +2,7 @@
 
 ## 目標
 在 Linux / WSL2 / macOS 上,以單一 Docker 映像(ROS 2 Jazzy)讀取 Yahboom 10 軸 IMU (CMP10A),
-提供 RViz2 與 Foxglove(經 rosbridge 或 foxglove_bridge)可視化,並提供照官方步驟(WitMotion 使用說明 v23-0529 §3.3)的校正工具與校正驗證。
+提供 RViz2 與 Foxglove(經 rosbridge 或 foxglove_bridge)可視化,並提供照官方步驟(WitMotion 使用說明 v23-0529 §3.3)的校正工具。
 使用者透過主機端 Python 互動選單腳本 `imu.py` 進入/操作 docker。
 
 ## 已驗證的硬體事實(2026-11-09 實機)
@@ -43,6 +43,7 @@ wit_ros2_imu/                   # ROS 2 ament_python 套件
   wit_ros2_imu/wit_protocol.py  # 純 Python(不 import rclpy)
   wit_ros2_imu/calibration.py   # 純 Python 軟體偏移模型、磁力計平面進度
   wit_ros2_imu/calibrate_cli.py # 互動校正選單(直接開序列埠,不需 ROS)
+  wit_ros2_imu/calibration_check.py # 磁力計校正前環境與安裝位置檢查的計算(純 Python)
   wit_ros2_imu/wit_ros2_imu.py  # ROS 2 driver node
   launch/imu.launch.py
   rviz/imu.rviz
@@ -96,7 +97,8 @@ mag_offset: [x, y, z]    # raw LSB
 互動選單(stdlib `input()`):
 1. 即時資料檢視 2. 加速度計水平校正(硬體) 3. 磁力計校正 橢球(硬體) 4. 磁力計校正 雙平面(硬體)
 5. Z 軸角度歸零(硬體,僅六軸) 6. 設定角度參考(硬體) 7. 高度歸零(硬體,氣壓計) 8. 讀取 IMU 內部偏移暫存器
-9. 陀螺儀自動校正 狀態(唯讀,0x61/0x63) 10. 演算法 六軸 / 九軸 切換(AXIS6 0x24) 11. 恢復原廠設定 12. 校正驗證(最後一步)/ 姿態檢視(唯讀;Enter 為以外部參考判定的五項檢測,規格見 docs/CALIBRATION_CHECK.md;f 為可設參考點看 Δ 的姿態檢視) 13. 氣壓高度輸出 開啟/關閉(RSW bit 6) 0. 離開
+9. 陀螺儀自動校正 狀態(唯讀,0x61/0x63) 10. 演算法 六軸 / 九軸 切換(AXIS6 0x24) 11. 恢復原廠設定 12. 氣壓高度輸出 開啟/關閉(RSW bit 6) 0. 離開
+- 開啟時讀 AXIS6,選單只列出目前演算法用得到的項目:六軸隱藏 3、4,九軸隱藏 5,讀不到全部列出;編號不變。選項 10 讀回、選項 11 送出重設後更新。輸入被隱藏的編號會說明原因,不執行
 - 任何寫入 flash 前都要求使用者確認 (y/N)
 - 硬體指令流程:unlock → CALSW → (等待/使用者操作) → CALSW NORMAL → save
 - 磁力計硬校無有效資料不開始;過程無資料、讀取失敗或中斷時嘗試 NORMAL 且不 SAVE。部分涵蓋須額外確認(預設否),不標完成;SAVE 前重檢解鎖。
@@ -106,8 +108,9 @@ mag_offset: [x, y, z]    # raw LSB
 - Z 軸歸零先讀 AXIS6:九軸拒絕;讀不到時說明並再確認。角度參考先顯示官方警告(與加速度計校正同時使用可能異常)。
 - 陀螺儀自動校正只讀不寫:不同型號的 0x63 意義不同,這顆模組的開關指令未確認。
 - 演算法切換:讀 AXIS6 → 確認 → unlock → 寫入 → save → 讀回;讀回相符才標完成。
-- 不再寫入軟體偏移;舊 YAML 仍由 driver 與選項 12 套用,硬體校正會清除對應欄位。
-- 校正改變後舊檢測結果失效;重測先撤銷受測項目舊結果。進度是提示,品質由選項 12 判定。
+- 不再寫入軟體偏移;舊 YAML 仍由 driver 套用,硬體校正會清除對應欄位。
+- 磁力計校正(3、4)前自動檢查環境與安裝位置,規格見 docs/CALIBRATION_CHECK.md。進度是提示,不代表校正品質。
+- 不提供校正後的合格判定:使用者依自己的模式(六軸 / 九軸)與用途判斷。
 - 序列埠開啟設 timeout;錯誤訊息清楚並以非 0 結束
 
 ### `wit_ros2_imu.py`(ROS 2 node,executable `wit_ros2_imu`)

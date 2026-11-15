@@ -14,69 +14,25 @@
 
 
 """
-Reference-based calibration check for the CMP10A (pure Python, no ROS).
+Environment and mounting check before a magnetometer calibration (pure Python, no ROS).
 
-Every test compares raw sensor output with a reference that does not come
-from the IMU itself, following common inertial-sensor test practice:
+The Earth's field is the same everywhere in a room and does not change over
+seconds.  So a field that moves while the IMU is still, changes when the IMU
+is slid without turning, or changes when the motors run, comes from the
+surroundings.  These checks only compare readings with each other: they need
+no calibration and no unit conversion.
 
-* accelerometer: six-position (tumble) test against gravity
-  (cf. IEEE Std 1293-2018);
-* gyroscope: static bias against zero rotation, and one full turn against a
-  physical reference line (bias / scale factor as defined in
-  IEEE Std 2700-2017);
-* magnetometer: constant field magnitude in every direction, and the dip
-  angle against the local inclination from the World Magnetic Model.
-
-The pass thresholds below are this project's own choices; the reasoning for
-each is written down in docs/CALIBRATION_CHECK.md.  The standards define how
-to measure, not what counts as good enough.
+The thresholds below are this project's own choices; the reasoning for each
+is written down in docs/CALIBRATION_CHECK.md.
 """
 
-from dataclasses import dataclass
 import math
-from typing import Dict, List, Sequence, Tuple
-
-from .wit_protocol import GRAVITY
+from typing import Sequence, Tuple
 
 Vector3 = Tuple[float, float, float]
 
-# Pass thresholds (see docs/CALIBRATION_CHECK.md for the reasoning).
-ACCEL_MAG_TOL = 0.1          # m/s^2; |a| on every face vs. GRAVITY  (~0.6 deg of tilt)
-ACCEL_OFFSET_TOL = 0.1       # m/s^2; (up + down) / 2 on each axis
-GYRO_BIAS_TOL_DPS = 0.02     # deg/s; static mean on each axis      (1.2 deg/min)
-TURN_TARGET_DEG = 360.0
-TURN_TOL_DEG = 3.0           # deg on one full turn                  (0.8 % scale)
-MAG_SPREAD_TOL = 0.05        # fraction of the mean |B|              (~3 deg heading)
-MAG_SPREAD_SHARE = 0.95      # share of samples that must be inside the band
-DIP_TOL_DEG = 3.0            # deg vs. the World Magnetic Model inclination
-
-FACE_MIN_FRACTION = 0.9      # the expected axis must read >= 0.9 g to count as "on the face"
+MAG_SPREAD_SHARE = 0.95      # share of samples that decides a field change (spikes ignored)
 MAX_GAP_S = 0.5              # longer gaps in gyro data are not integrated
-
-AXES = ('X', 'Y', 'Z')
-FACES = (('Z', +1), ('Z', -1), ('X', +1), ('X', -1), ('Y', +1), ('Y', -1))
-
-
-def axis_index(axis: str) -> int:
-    """Return 0, 1 or 2 for 'X', 'Y' or 'Z'."""
-    return AXES.index(axis)
-
-
-def face_label(axis: str, sign: int) -> str:
-    """Return e.g. 'Z 軸朝上' for ('Z', +1)."""
-    return f'{axis} 軸朝{"上" if sign > 0 else "下"}'
-
-
-def face_name(accel: Sequence[float]) -> str:
-    """Return the label of the face the IMU is currently resting on."""
-    i = max(range(3), key=lambda k: abs(accel[k]))
-    return face_label(AXES[i], 1 if accel[i] >= 0 else -1)
-
-
-def facing(accel: Sequence[float], axis: str, sign: int,
-           min_fraction: float = FACE_MIN_FRACTION) -> bool:
-    """Return True if ``axis`` points up (sign +1) or down (-1) within ~25 deg."""
-    return sign * accel[axis_index(axis)] >= min_fraction * GRAVITY
 
 
 def _norm(v: Sequence[float]) -> float:
@@ -90,165 +46,6 @@ def _mean3(samples: Sequence[Sequence[float]]) -> Vector3:
     return (sum(s[0] for s in samples) / n, sum(s[1] for s in samples) / n,
             sum(s[2] for s in samples) / n)
 
-
-@dataclass
-class FaceResult:
-    """Mean accelerometer reading on one face."""
-
-    axis: str
-    sign: int
-    mean: Vector3
-    magnitude: float
-
-    @property
-    def ok(self) -> bool:
-        """Return True if |a| on this face is within ACCEL_MAG_TOL of gravity."""
-        return abs(self.magnitude - GRAVITY) <= ACCEL_MAG_TOL
-
-
-@dataclass
-class AccelResult:
-    """Outcome of the six-face test."""
-
-    faces: List[FaceResult]
-    offsets: Vector3
-
-    @property
-    def magnitudes_ok(self) -> bool:
-        """Return True if every face reads 1 g."""
-        return all(f.ok for f in self.faces)
-
-    @property
-    def offsets_ok(self) -> bool:
-        """Return True if every axis is centred on zero."""
-        return all(abs(o) <= ACCEL_OFFSET_TOL for o in self.offsets)
-
-    @property
-    def ok(self) -> bool:
-        """Return True if the accelerometer passes."""
-        return self.magnitudes_ok and self.offsets_ok
-
-
-def evaluate_face(axis: str, sign: int, samples: Sequence[Sequence[float]]) -> FaceResult:
-    """Average the accelerometer samples (m/s^2) taken on one face."""
-    mean = _mean3(samples)
-    return FaceResult(axis, sign, mean, _norm(mean))
-
-
-def evaluate_six_faces(faces: Dict[Tuple[str, int], FaceResult]) -> AccelResult:
-    """
-    Combine the six faces.
-
-    The offset of an axis is the mean of its readings with that axis up and
-    down: +g and -g cancel and only the offset remains.
-    """
-    missing = [k for k in FACES if k not in faces]
-    if missing:
-        raise ValueError(f'missing faces: {missing}')
-    offsets = tuple((faces[(a, +1)].mean[axis_index(a)] + faces[(a, -1)].mean[axis_index(a)])
-                    / 2.0 for a in AXES)
-    return AccelResult([faces[k] for k in FACES], offsets)
-
-
-def gyro_bias_dps(samples: Sequence[Sequence[float]]) -> Vector3:
-    """Return the mean of gyro samples (rad/s) in deg/s."""
-    return tuple(math.degrees(c) for c in _mean3(samples))
-
-
-def gyro_bias_ok(bias_dps: Sequence[float]) -> bool:
-    """Return True if every axis of the static mean is within GYRO_BIAS_TOL_DPS."""
-    return all(abs(b) <= GYRO_BIAS_TOL_DPS for b in bias_dps)
-
-
-class TurnIntegrator:
-    """Integrate the Z angular rate (rad/s) over time (s) with the trapezoid rule."""
-
-    def __init__(self):
-        """Start at zero."""
-        self.angle_deg = 0.0
-        self._last = None
-
-    def add(self, t: float, rate_rad_s: float) -> float:
-        """Add one sample taken at time ``t``; return the angle so far in degrees."""
-        if self._last is not None:
-            t0, r0 = self._last
-            dt = t - t0
-            if 0.0 < dt <= MAX_GAP_S:
-                self.angle_deg += math.degrees((r0 + rate_rad_s) / 2.0 * dt)
-        self._last = (t, rate_rad_s)
-        return self.angle_deg
-
-
-def turn_ok(angle_deg: float) -> bool:
-    """Return True if the integrated angle is one full turn within TURN_TOL_DEG."""
-    return abs(abs(angle_deg) - TURN_TARGET_DEG) <= TURN_TOL_DEG
-
-
-def magnitude_spread(mags: Sequence[Sequence[float]]) -> float:
-    """
-    Return the band, as a fraction of the mean |B|, that holds MAG_SPREAD_SHARE of samples.
-
-    With a well calibrated magnetometer |B| is the same in every direction.
-    A share below 100 % keeps a few spikes (a phone passing by) from deciding.
-    """
-    norms = [_norm(m) for m in mags]
-    if not norms:
-        raise ValueError('no samples')
-    mean = sum(norms) / len(norms)
-    if mean <= 0:
-        raise ValueError('magnetometer reads zero')
-    deviations = sorted(abs(n - mean) for n in norms)
-    k = max(0, math.ceil(MAG_SPREAD_SHARE * len(deviations)) - 1)
-    return deviations[k] / mean
-
-
-def magnitude_ok(spread: float) -> bool:
-    """Return True if the magnitude band is within MAG_SPREAD_TOL."""
-    return spread <= MAG_SPREAD_TOL
-
-
-def dip_angle_deg(accel: Sequence[float], mag: Sequence[float]) -> float:
-    """
-    Return the angle of the field below the horizontal plane, in degrees.
-
-    At rest the accelerometer points up, so "down" is -accel.  The result is
-    independent of how the IMU is held, which makes it comparable with the
-    inclination (I) given by the World Magnetic Model.
-    """
-    na = _norm(accel)
-    nm = _norm(mag)
-    if na <= 0 or nm <= 0:
-        raise ValueError('zero vector')
-    down_component = -sum(a * m for a, m in zip(accel, mag)) / na
-    return math.degrees(math.asin(max(-1.0, min(1.0, down_component / nm))))
-
-
-def mean_dip(pairs: Sequence[Tuple[Sequence[float], Sequence[float]]]) -> float:
-    """Return the mean dip angle over (accel, mag) pairs."""
-    if not pairs:
-        raise ValueError('no samples')
-    return sum(dip_angle_deg(a, m) for a, m in pairs) / len(pairs)
-
-
-def dip_ok(measured_deg: float, expected_deg: float) -> bool:
-    """Return True if the measured dip is within DIP_TOL_DEG of the expected one."""
-    return abs(measured_deg - expected_deg) <= DIP_TOL_DEG
-
-
-def parse_dip(text: str) -> float:
-    """Parse a local inclination in degrees (-90..90); raise ValueError otherwise."""
-    value = float(text.strip())
-    if not math.isfinite(value) or not -90.0 <= value <= 90.0:
-        raise ValueError(f'inclination must be between -90 and 90 degrees, got {text!r}')
-    return value
-
-
-# ----------------------------------------- environment and mounting position
-#
-# Checked before a magnetometer calibration.  The Earth's field is the same
-# everywhere in a room and does not change over seconds, so a field that moves
-# while the IMU is still, changes when the IMU is slid without turning, or
-# changes when the motors run, comes from the surroundings.
 
 ENV_NOISE_TOL = 0.01         # std of |B| at rest / mean |B|          (sensor noise ~0.5 %)
 ENV_CHANGE_TOL = 0.05        # field change / |B| when slid or with motors running (~3 deg)

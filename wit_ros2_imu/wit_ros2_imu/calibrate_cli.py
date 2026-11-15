@@ -37,7 +37,7 @@ import serial
 
 from . import calibration_check as cc
 from . import wit_protocol as wp
-from .calibration import (load_calibration, MAG_COVERAGE_TARGET, MagCoverage, PlaneCoverage,
+from .calibration import (load_calibration, PlaneCoverage,
                           save_calibration, SoftwareCalibration)
 
 logger = logging.getLogger(__name__)
@@ -90,9 +90,8 @@ NO_DATA_HINT_AFTER = 3.0    # s without gyro data before falling back to an elap
 READER_YIELD = 0.005        # s; real-time pause per read so the Enter prompt stays responsive
 READER_JOIN_TIMEOUT = 2.0   # s; > SERIAL_TIMEOUT so a blocked read can finish
 PROGRESS_WIDTH = 20
-ATTITUDE_INTERVAL = 0.2     # s between attitude-view refreshes
+ATTITUDE_INTERVAL = 0.2     # s between live-line refreshes in the environment check
 PRESS_BIT = 1 << 6          # RSW bit enabling the 0x56 pressure / height packet
-AXIS_BAR_WIDTH = 8          # per-axis bars; keeps the status line within 79 columns
 CLEAR_EOL = '\x1b[K'
 CLEAR_SCREEN = '\x1b[2J\x1b[H'
 # Take back the line break the terminal echoed for Enter, so a view keeps one line.
@@ -108,7 +107,7 @@ OFFSET_REGISTERS = [
 MENU = """
 ========== CMP10A IMU 校正工具 ==========
  1. 即時資料檢視                          → 任何地方
- 2. 加速度計水平校正(硬體)                → 水平桌面、靜止,高度不拘
+ 2. 加速度計水平校正(硬體)                → 裝在車上,車停真正水平的地面
  3. 磁力計校正 橢球(硬體)                 → 離電腦 50 cm,拿在空中轉
  4. 磁力計校正 雙平面(硬體)               → 先水平、再垂直,各轉一圈
  5. Z 軸角度歸零(硬體,僅六軸)             → 靜止放置
@@ -118,14 +117,9 @@ MENU = """
  9. 陀螺儀自動校正 狀態(唯讀)             → 任何地方
 10. 演算法 六軸 / 九軸 切換               → 寫入 IMU 設定
 11. 恢復原廠設定                          → 任何地方
-12. 校正驗證(最後一步)/ 姿態檢視          → 全部校正完後,判定是否真的校正好
-13. 氣壓高度輸出 開啟/關閉                → 寫入 IMU 設定
+12. 氣壓高度輸出 開啟/關閉                → 寫入 IMU 設定
  0. 離開
 =========================================="""
-
-ATTITUDE_HELP = [
-    '操作:Enter = 設定參考點(之後顯示相對變化 Δ)  r = 清除參考點  q = 離開(Ctrl+C 也可以)',
-]
 
 # Appended to a menu row once that step has succeeded in this run of the tool.
 # The marks live in memory only: a new run starts with none, so a green row
@@ -133,25 +127,29 @@ ATTITUDE_HELP = [
 DONE_MARK = '✓ 本次已完成'
 _MENU_ROW = re.compile(r'^\s*(\d+)\.')
 
+# The menu follows the algorithm read from the module (AXIS6: 0 nine-axis, 1
+# six-axis).  Rows the current algorithm cannot use are hidden; the numbers
+# stay the same so the tutorial still matches.  Unknown (None) shows them all.
+MODE_NAMES = {0: '九軸', 1: '六軸'}
+HIDDEN_BY_MODE = {
+    1: ('3', '4'),      # six-axis: the yaw does not use the magnetometer
+    0: ('5',),          # nine-axis: official, Z-axis zero only works in six-axis
+}
+HIDDEN_NOTE = {
+    1: '(3、4 磁力計校正:六軸用不到,已隱藏)',
+    0: '(5 Z 軸歸零:九軸用不到,已隱藏)',
+    None: '(讀不到演算法設定,全部列出)',
+}
+HIDDEN_REASON = {
+    1: '目前是六軸:yaw 不用磁力計,不需要磁力計校正(3、4)。要用磁力計,先選 10 切換到九軸。',
+    0: '目前是九軸:官方說明 Z 軸歸零只在六軸有效。要歸零,先選 10 切換到六軸。',
+}
 
-# Calibration check (option 12).  Pass thresholds live in calibration_check.py;
-# the values here only control how the data is collected.
+
+# Environment check before a magnetometer calibration.  Pass thresholds live
+# in calibration_check.py; the values here only control how data is collected.
 STILL_GYRO_DPS = 2.0          # |gyro| below this counts as "not moving"
 STILL_HOLD_S = 1.0            # hold still this long before a measurement starts
-FACE_SAMPLE_S = 5.0           # accelerometer averaging time per face
-GYRO_STILL_S = 300.0          # static gyro test duration (5 minutes)
-MOVE_ACCEL = 0.5              # m/s^2 change of any accel axis = the IMU was moved
-FAST_TURN_DPS = 90.0          # warn above this rate during the full-turn test
-DIP_MAX_RATE_DPS = 30.0       # accel is only gravity when turning slower than this
-DIP_ACCEL_TOL = 0.5           # m/s^2; | |a| - g | above this = accelerating
-MAG_MIN_SAMPLES = 50
-DIP_MIN_PAIRS = 20
-NOAA_CALCULATOR = 'https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml'
-CHECK_ITEMS = ('accel', 'gyro_still', 'gyro_turn', 'mag_norm', 'mag_dip')
-CHECK_TITLE = '== 校正檢測 =='
-ITEM_LABELS = {'accel': '1. 加速度計', 'gyro_still': '2. 陀螺儀 靜止', 'gyro_turn': '3. 陀螺儀 轉一圈',
-               'mag': '4–5. 磁力計'}
-# Environment / mounting check before a magnetometer calibration.
 ENV_STILL_S = 5.0
 SLIDE_DISTANCE_CM = 30
 MOTOR_BASE_S = 3.0
@@ -171,32 +169,17 @@ PRECHECK_INTRO = [
 PASS, FAIL, SKIP, NOTE = '合格', '不合格', '略過', '注意'
 ANSI_COLOURS = {PASS: '\033[32m', FAIL: '\033[31m', SKIP: '\033[33m', NOTE: '\033[33m'}
 ANSI_RESET = '\033[0m'
-CHECK_INTRO = [
-    '每一項都拿「IMU 以外的已知參考」比對原始讀數,不使用模組自己算的角度:',
-    '  重力 1 g、靜止時角速度為 0、桌上的參考線、NOAA 地磁模型的當地磁傾角。',
-    '合格門檻與理由見 docs/CALIBRATION_CHECK.md。q = 結束檢測,s = 略過這一項。',
-]
-BACK_TO_MENU = '按 Enter 返回選單:'   # results stay on screen until the user is done reading
-CHECK_FAIL_HINTS = [
-    '不合格時:',
-    '  - 加速度計:在水平桌面重做選項 2。',
-    '  - 陀螺儀靜止:通電 5 分鐘、靜止放著,讓模組的陀螺儀自動校正修正後再測'
-    '(官方預設開啟,選項 9 可看狀態)。',
-    '  - 陀螺儀轉一圈:轉慢一點、確實對準參考線再測一次;仍不合格是陀螺儀刻度誤差,'
-    '本模組沒有可校正刻度的指令。',
-    '  - 磁力計:清空周圍 20 cm 的電器與鐵件,重做選項 3 或 4。',
-]
 
 
 class _VerifyQuit(Exception):
-    """Raised inside the guided verification when the user enters q."""
+    """Raised inside the environment check when the user enters q."""
 
 
 # Shown before every magnetometer calibration that displays per-axis progress.
 MAG_PROGRESS_HELP = [
     '下方顯示每個平面的進度(和官方軟體的 XY、XZ、YZ 三張圖一樣:畫出一圈才算):',
     '  XY 不夠 → 繞 Z 軸轉;XZ 不夠 → 繞 Y 軸轉;YZ 不夠 → 繞 X 軸轉。',
-    '進度只表示轉得夠不夠,不保證品質;全部校正完,用選項 12 驗證。',
+    '進度只表示轉得夠不夠,不保證校正品質。',
 ]
 
 # Placement / precaution notes shown after a calibration item is chosen,
@@ -204,7 +187,8 @@ MAG_PROGRESS_HELP = [
 NOTES: Dict[str, List[str]] = {
     '2': [
         '- 官方:模組水平靜止放置,約 2 秒後三軸加速度應約為 0、0、1 g,X、Y 角度約 0°。',
-        '- 放在真正水平的桌面上,最好用水平儀確認;校正期間不要碰桌子。',
+        '- IMU 裝在車上的最終位置,車子停在真正水平的地面(用水平儀確認);兩個條件都要。',
+        '- 校正期間不要碰車子,馬達要停。',
     ],
     '3': [
         '- 官方:離電腦 50 cm 以上,拿在空中轉;不要直接在桌面上轉(桌下常有鐵樑)。',
@@ -225,7 +209,7 @@ NOTES: Dict[str, List[str]] = {
     ],
     '7': [
         '- 官方:以目前氣壓作為 0 m 高度;在你要當作 0 m 的位置執行。',
-        '- CMP10A 出廠預設不輸出氣壓(0x56):請先用選項 13 開啟,',
+        '- CMP10A 出廠預設不輸出氣壓(0x56):請先用選項 12 開啟,',
         '  才會有 /imu/pressure 與高度。',
     ],
     '10': [
@@ -259,11 +243,10 @@ class CalibrationMenu:
         self._time = time_fn
         self._unlock_time: Optional[float] = None
         self._verify_lines: List[str] = []
-        self._verify_title = CHECK_TITLE
+        self._verify_title = ''
         self._check_cal = SoftwareCalibration()
-        self._check_passed: set = set()   # check items passed in this run
-        self._expected_dip: Optional[float] = None
         self._done: set = set()          # menu choices that succeeded in this run
+        self._axis6: Optional[int] = None  # algorithm read from the module; None = unknown
         self._step_ok = False            # set by an action when it succeeds
         self._mag_covered = False
         self._actions = {
@@ -278,8 +261,7 @@ class CalibrationMenu:
             '9': self.gyro_autocal_status,
             '10': self.switch_algorithm,
             '11': self.factory_reset,
-            '12': self.attitude_view,
-            '13': self.toggle_pressure_output,
+            '12': self.toggle_pressure_output,
         }
 
     # ------------------------------------------------------------ helpers
@@ -343,21 +325,14 @@ class CalibrationMenu:
 
     def _save(self, cal: SoftwareCalibration) -> None:
         save_calibration(self.config_path, cal)
-        self._invalidate_checks()
         self._out(f'已寫入 {self.config_path}')
         self._out(f'  gyro_bias  [rad/s]  = {_fmt3(cal.gyro_bias, 6)}')
         self._out(f'  accel_bias [m/s^2]  = {_fmt3(cal.accel_bias, 4)}')
         self._out(f'  mag_offset [LSB]    = {_fmt3(cal.mag_offset, 1)}')
         self._out('重新啟動 IMU 節點後生效。')
 
-    def _invalidate_checks(self) -> None:
-        """Measurements made before a calibration change no longer certify it."""
-        self._check_passed.clear()
-        self._done.discard('12')
-
     def _reset_software_offsets(self, fields) -> bool:
         """Clear residual offsets before persisting a new hardware baseline."""
-        self._invalidate_checks()
         if not fields or not os.path.exists(self.config_path):
             return True
         try:
@@ -371,7 +346,6 @@ class CalibrationMenu:
                       '不要載入舊值啟動 driver。')
             return False
         self._out(f'已將 {self.config_path} 的 {", ".join(fields)} 歸零,保留其他欄位。')
-        self._out('全部校正完後,用選項 12 驗證是否真的校正好。')
         return True
 
     def _status(self, text: str) -> None:
@@ -392,11 +366,6 @@ class CalibrationMenu:
             self._sleep(step)
         self._status(f'{label} {progress_bar(1.0)}  完成')
         self._end_status()
-
-    @staticmethod
-    def _axis_bars(cov: MagCoverage) -> str:
-        return '  '.join(f'{name} {progress_bar(p, AXIS_BAR_WIDTH)}'
-                         for name, p in zip('XYZ', cov.axis_progress()))
 
     @staticmethod
     def _plane_line(stage_text: Optional[str], cov: PlaneCoverage, last: bool,
@@ -529,7 +498,6 @@ class CalibrationMenu:
         if mode == wp.CalMode.MAG_DUAL_PLANE and not self._wait_level():
             return
         self._unlock()
-        self._invalidate_checks()
         choices = {wp.CalMode.ACCEL: ('2',), wp.CalMode.MAG_SPHERE: ('3', '4'),
                    wp.CalMode.MAG_DUAL_PLANE: ('3', '4'), wp.CalMode.HEADING_ZERO: ('5',),
                    wp.CalMode.ANGLE_REF: ('6',), wp.CalMode.HEIGHT_ZERO: ('7',)}
@@ -560,9 +528,9 @@ class CalibrationMenu:
         try:
             self._send(wp.cmd_save())
         except (serial.SerialException, OSError):
-            self._out('儲存指令失敗,硬體狀態未知;舊軟體偏移已停用,請重新上電後用 12 檢測。')
+            self._out('儲存指令失敗,硬體狀態未知;舊軟體偏移已停用,請重新上電。')
             raise
-        self._out('已送出儲存指令。全部校正完後,用選項 12 驗證是否真的校正好。')
+        self._out('已送出儲存指令。')
         if mag_progress and not self._mag_covered:
             return
         self._step_ok = True
@@ -711,10 +679,11 @@ class CalibrationMenu:
         """Switch between the six-axis and nine-axis algorithm (AXIS6, 0x24)."""
         self._out('== 演算法 六軸 / 九軸 ==')
         axis6 = self._read_axis6()
+        self._axis6 = axis6
         if axis6 is None:
             self._out('讀取演算法設定 (0x24) 逾時,未做任何變更;請確認連線與鮑率。')
             return
-        names = {0: '九軸', 1: '六軸'}
+        names = MODE_NAMES
         new = 1 - axis6
         self._out(f'目前:{names[axis6]}')
         if not self._confirm(f'要切換成{names[new]}嗎?(會寫入 IMU flash)'):
@@ -724,8 +693,8 @@ class CalibrationMenu:
         self._send(wp.cmd_write(REG_AXIS6, new))
         self._ensure_unlocked()
         self._send(wp.cmd_save())
-        self._invalidate_checks()
-        if self._read_axis6() == new:
+        self._axis6 = self._read_axis6()
+        if self._axis6 == new:
             self._out(f'已切換為{names[new]}並送出儲存指令。')
             self._step_ok = True
         else:
@@ -733,29 +702,7 @@ class CalibrationMenu:
         self._out('官方:切換後要重做加速度計校正(2)' +
                   (',並做 Z 軸歸零(5)。' if new == 1 else '與磁力計校正(3 或 4)。'))
 
-    def attitude_view(self) -> None:
-        """Run the calibration check, or open the free attitude view."""
-        self._out('== 校正檢測 / 姿態檢視(唯讀)==')
-        choices = {'': ('accel', 'gyro_still', 'gyro_turn', 'mag'), '1': ('accel',),
-                   '2': ('gyro_still',), '3': ('gyro_turn',), '4': ('mag',)}
-        cmd = self._ask('Enter = 完整檢測(約 10 分鐘)  1 加速度計  2 陀螺儀靜止(5 分鐘)  '
-                        '3 陀螺儀轉一圈  4 磁力計  5 環境 / 安裝位置  f = 姿態檢視  '
-                        'q = 返回:').lower()
-        if cmd == 'q':
-            return
-        if cmd == '5':
-            self._mag_precheck(report_only=True)
-            self._ask(BACK_TO_MENU)
-            return
-        if cmd == 'f':
-            self._attitude_free_view()
-            return
-        if cmd not in choices:
-            self._out(f'無效的選擇 {cmd!r}。')
-            return
-        self.calibration_check(choices[cmd])
-
-    # ---------------------------------------------------- calibration check
+    # ------------------------------------ live screen of the environment check
 
     def _mark(self, status: str, text: str) -> str:
         line = f'[{status}] {text}'
@@ -825,299 +772,12 @@ class CalibrationMenu:
         finally:
             self._end_status()
 
-    def _set_passed(self, item: str, ok: bool) -> None:
-        """Keep the latest outcome of a check item: a failure cancels an earlier pass."""
-        if ok:
-            self._check_passed.add(item)
-        else:
-            self._check_passed.discard(item)
-
     @staticmethod
     def _still(gyro) -> bool:
         if gyro is None:
             return False
         rate = math.degrees(math.sqrt(gyro.x ** 2 + gyro.y ** 2 + gyro.z ** 2))
         return rate < STILL_GYRO_DPS
-
-    # -- 1. accelerometer: six faces against gravity
-
-    def _check_accel_face(self, axis: str, sign: int, index: int) -> Optional[cc.FaceResult]:
-        label = cc.face_label(axis, sign)
-        st = {'gyro': None, 'accel': None, 'hold': None, 'start': None, 'samples': []}
-
-        def on_packet(p, now):
-            if isinstance(p, wp.Gyro):
-                st['gyro'] = p
-                return
-            if not isinstance(p, wp.Accel):
-                return
-            st['accel'] = p
-            if not (cc.facing((p.x, p.y, p.z), axis, sign) and self._still(st['gyro'])):
-                st['hold'] = st['start'] = None
-                st['samples'] = []
-                return
-            if st['hold'] is None:
-                st['hold'] = now
-            if st['start'] is None and now - st['hold'] >= STILL_HOLD_S:
-                st['start'] = now
-            if st['start'] is not None:
-                st['samples'].append((p.x, p.y, p.z))
-
-        def done(now):
-            return (st['start'] is not None and now - st['start'] >= FACE_SAMPLE_S
-                    and len(st['samples']) >= 3)
-
-        def status(now):
-            a = st['accel']
-            if a is None:
-                return '等待加速度資料...'
-            vec = (a.x, a.y, a.z)
-            vals = (f'accel=({a.x:+6.2f},{a.y:+6.2f},{a.z:+6.2f})  '
-                    f'|a| {math.sqrt(a.x ** 2 + a.y ** 2 + a.z ** 2):5.2f}')
-            if not cc.facing(vec, axis, sign):
-                return f'目前:{cc.face_name(vec)},請改成 {label}  {vals}'
-            if st['start'] is not None:
-                bar = progress_bar((now - st['start']) / FACE_SAMPLE_S, 10)
-                return f'量測中,保持不動 {bar}  {vals}'
-            return f'方向正確,保持不動...  {vals}'
-
-        prompt = (f'加速度計 {index}/6:讓 {label}(靠著方形盒子擺正),'
-                  f'擺好不動會自動量 {FACE_SAMPLE_S:.0f} 秒(s 略過 / q 結束):')
-        while True:
-            cmd = self._watch(prompt, status, on_packet, done)
-            if cmd is None:
-                return cc.evaluate_face(axis, sign, st['samples'])
-            if cmd == 's':
-                return None
-            self._out('這一步會自動量測:擺好、不要動即可。')
-
-    def _check_accel(self, results) -> None:
-        name = '1. 加速度計 六面測試'
-        faces = {}
-        for index, (axis, sign) in enumerate(cc.FACES, start=1):
-            face = self._check_accel_face(axis, sign, index)
-            if face is None:
-                self._record(results, SKIP, name)
-                return
-            faces[(axis, sign)] = face
-            self._verify_note('  ' + self._mark(
-                PASS if face.ok else FAIL,
-                f'{cc.face_label(axis, sign)}:|a| {face.magnitude:.3f} m/s²'))
-        acc = cc.evaluate_six_faces(faces)
-        ox, oy, oz = acc.offsets
-        self._record(results, PASS if acc.ok else FAIL,
-                     f'{name}:各面 |a| 與 {wp.GRAVITY:.2f} 差 ±{cc.ACCEL_MAG_TOL} 內 '
-                     f'{"是" if acc.magnitudes_ok else "否"};偏移 X {ox:+.3f} Y {oy:+.3f} '
-                     f'Z {oz:+.3f} m/s²(標準 ±{cc.ACCEL_OFFSET_TOL})')
-        self._set_passed('accel', acc.ok)
-
-    # -- 2. gyroscope at rest against zero rotation
-
-    def _check_gyro_still(self, results) -> None:
-        name = '2. 陀螺儀 靜止測試'
-        st = {'gyro': None, 'ref': None, 'ref_gyro': None, 'hold': None, 'start': None,
-              'samples': [], 'restarts': 0, 'accel': None}
-
-        def start(now):
-            st['start'] = now
-            st['ref'] = st['accel']
-            st['ref_gyro'] = st['gyro']
-            st['samples'] = []
-
-        def turned(p) -> bool:
-            # Compared with the rate at the start, so a large bias is not "turning".
-            ref = st['ref_gyro']
-            if ref is None:
-                return False
-            diff = math.sqrt((p.x - ref.x) ** 2 + (p.y - ref.y) ** 2 + (p.z - ref.z) ** 2)
-            return math.degrees(diff) > STILL_GYRO_DPS
-
-        def moved(p) -> bool:
-            ref = st['ref']
-            return ref is not None and any(
-                abs(a - b) > MOVE_ACCEL for a, b in zip((p.x, p.y, p.z), (ref.x, ref.y, ref.z)))
-
-        def on_packet(p, now):
-            if isinstance(p, wp.Gyro):
-                st['gyro'] = p
-                if st['start'] is not None and turned(p):
-                    st['start'] = st['hold'] = None
-                    st['restarts'] += 1
-                elif st['start'] is not None:
-                    st['samples'].append((p.x, p.y, p.z))
-            elif isinstance(p, wp.Accel):
-                st['accel'] = p
-                if st['start'] is not None:
-                    if moved(p):
-                        st['start'] = st['hold'] = None
-                        st['restarts'] += 1
-                elif not self._still(st['gyro']):
-                    st['hold'] = None
-                elif st['hold'] is None:
-                    st['hold'] = now
-                elif now - st['hold'] >= STILL_HOLD_S:
-                    start(now)
-
-        def done(now):
-            return (st['start'] is not None and now - st['start'] >= GYRO_STILL_S
-                    and len(st['samples']) >= 10)
-
-        def status(now):
-            if st['start'] is None:
-                note = '(偵測到移動,已重新開始)' if st['restarts'] else ''
-                return f'等待靜止...{note}'
-            left = max(0.0, GYRO_STILL_S - (now - st['start']))
-            bar = progress_bar((now - st['start']) / GYRO_STILL_S, 10)
-            mean = cc.gyro_bias_dps(st['samples']) if st['samples'] else (0.0, 0.0, 0.0)
-            return (f'量測中 {bar} 剩 {int(left) // 60}:{int(left) % 60:02d}  '
-                    f'平均 X {mean[0]:+.3f} Y {mean[1]:+.3f} Z {mean[2]:+.3f} °/s')
-
-        prompt = (f'陀螺儀靜止:把 IMU 放在桌上不要碰,靜止後自動量 {GYRO_STILL_S / 60:.0f} 分鐘'
-                  '(Enter 立即開始 / s 略過 / q 結束):')
-        while True:
-            cmd = self._watch(prompt, status, on_packet, done)
-            if cmd is None:
-                break
-            if cmd == 's':
-                self._record(results, SKIP, name)
-                return
-            if cmd == '' and st['start'] is not None:
-                self._out('量測中,不用按 Enter;要中斷請按 s 或 q。')
-            elif cmd == '' and st['accel'] is not None:
-                start(self._time())
-        bias = cc.gyro_bias_dps(st['samples'])
-        ok = cc.gyro_bias_ok(bias)
-        self._record(results, PASS if ok else FAIL,
-                     f'{name}:平均 X {bias[0]:+.3f} Y {bias[1]:+.3f} Z {bias[2]:+.3f} °/s'
-                     f'(標準 ±{cc.GYRO_BIAS_TOL_DPS};Z 軸換算每分鐘漂 '
-                     f'{abs(bias[2]) * 60:.1f}°)')
-        self._set_passed('gyro_still', ok)
-
-    # -- 3. gyroscope: one full turn against a reference line
-
-    def _check_gyro_turn(self, results) -> None:
-        name = '3. 陀螺儀 轉一圈測試'
-        cmd = self._watch('陀螺儀轉一圈:IMU 平放,對齊桌上的參考線(桌邊或一條膠帶),'
-                          '準備好按 Enter(s 略過 / q 結束):',
-                          lambda now: '對齊參考線後按 Enter')
-        if cmd == 's':
-            self._record(results, SKIP, name)
-            return
-        integ = cc.TurnIntegrator()
-        st = {'rate': 0.0}
-
-        def on_packet(p, now):
-            if isinstance(p, wp.Gyro):
-                st['rate'] = math.degrees(p.z)
-                integ.add(now, p.z)
-
-        def status(now):
-            fast = '  太快了,請放慢' if abs(st['rate']) > FAST_TURN_DPS else ''
-            return (f'已轉 {integ.angle_deg:+7.1f}°(目標 ±{cc.TURN_TARGET_DEG:.0f}°)'
-                    f'  轉速 {st["rate"]:+6.1f}°/s{fast}')
-
-        while True:
-            cmd = self._watch('  水平慢慢轉一整圈(10 秒以上),對回同一條參考線後按 Enter。'
-                              '請看參考線對齊,不要看數字(s 略過 / q 結束):',
-                              status, on_packet)
-            if cmd == 's':
-                self._record(results, SKIP, name)
-                return
-            if cmd == '':
-                break
-        angle = integ.angle_deg
-        ok = cc.turn_ok(angle)
-        self._record(results, PASS if ok else FAIL,
-                     f'{name}:陀螺儀累加 {angle:+.1f}°(標準 ±{cc.TURN_TARGET_DEG:.0f}° '
-                     f'±{cc.TURN_TOL_DEG:.0f}°)')
-        self._set_passed('gyro_turn', ok)
-
-    # -- 4. magnetometer: constant |B| and the local dip angle
-
-    def _ask_dip(self) -> Optional[float]:
-        """Ask the local inclination every time, offering the last value."""
-        self._verify_redraw()
-        self._out(f'磁傾角:到 NOAA 地磁計算器輸入所在位置,查 Inclination:{NOAA_CALCULATOR}')
-        self._out('  (台灣約 30–37°,依地點不同)')
-        last = self._expected_dip
-        if last is None:
-            prompt = '輸入當地磁傾角(度);直接 Enter 略過磁傾角判定:'
-        else:
-            prompt = f'輸入當地磁傾角(度);直接 Enter 使用上次 {last:.1f},s 略過磁傾角判定:'
-        while True:
-            text = self._ask(prompt)
-            if text.lower() == 'q':
-                raise _VerifyQuit
-            if text.lower() == 's':
-                return None
-            if not text:
-                return last
-            try:
-                self._expected_dip = cc.parse_dip(text)
-                return self._expected_dip
-            except ValueError:
-                self._out('請輸入 -90 到 90 之間的數字,例如 35.8。')
-
-    def _check_mag(self, results) -> None:
-        name_norm = '4. 磁力計 合成大小'
-        name_dip = '5. 磁力計 磁傾角'
-        expected = self._ask_dip()
-        # Coverage is judged from the gravity direction (accelerometer), not from
-        # the magnetometer itself: it shows every face has been up and down,
-        # whatever state the magnetometer calibration is in.
-        cov = MagCoverage(wp.GRAVITY, target=MAG_COVERAGE_TARGET)
-        st = {'gyro': None, 'accel': None, 'mags': [], 'pairs': []}
-
-        def on_packet(p, now):
-            if isinstance(p, wp.Gyro):
-                st['gyro'] = p
-            elif isinstance(p, wp.Accel):
-                st['accel'] = p
-                cov.add(p)
-            elif isinstance(p, wp.Mag):
-                vec = (p.x, p.y, p.z)
-                st['mags'].append(vec)
-                a, g = st['accel'], st['gyro']
-                if a is not None and g is not None:
-                    rate = math.degrees(math.sqrt(g.x ** 2 + g.y ** 2 + g.z ** 2))
-                    norm_a = math.sqrt(a.x ** 2 + a.y ** 2 + a.z ** 2)
-                    if rate < DIP_MAX_RATE_DPS and abs(norm_a - wp.GRAVITY) < DIP_ACCEL_TOL:
-                        st['pairs'].append(((a.x, a.y, a.z), vec))
-
-        def done(now):
-            return (cov.complete() and len(st['mags']) >= MAG_MIN_SAMPLES
-                    and len(st['pairs']) >= DIP_MIN_PAIRS)
-
-        def status(now):
-            tail = ('缺 ' + ' '.join(cov.missing_axes())) if not cov.complete() else '轉慢一點'
-            return f'{self._axis_bars(cov)}  {len(st["mags"])} 筆  {tail}'
-
-        cmd = self._watch('磁力計:往各個方向慢慢轉(每一面都朝上、朝下過),三條進度條都滿會自動結束'
-                          '(Enter 提早結束 / s 略過 / q 結束):', status, on_packet, done)
-        if cmd == 's':
-            self._record(results, SKIP, name_norm)
-            self._record(results, SKIP, name_dip)
-            return
-        if not cov.complete() or len(st['mags']) < MAG_MIN_SAMPLES:
-            self._record(results, SKIP, f'{name_norm}:方向涵蓋不足,無法判定')
-        else:
-            spread = cc.magnitude_spread(st['mags'])
-            ok = cc.magnitude_ok(spread)
-            self._record(results, PASS if ok else FAIL,
-                         f'{name_norm}:{cc.MAG_SPREAD_SHARE:.0%} 的讀數在平均值 '
-                         f'±{spread:.1%} 內(標準 ±{cc.MAG_SPREAD_TOL:.0%})')
-            self._set_passed('mag_norm', ok)
-        if expected is None:
-            self._record(results, SKIP, f'{name_dip}:未輸入當地磁傾角')
-        elif len(st['pairs']) < DIP_MIN_PAIRS:
-            self._record(results, SKIP, f'{name_dip}:慢速轉動的資料不足,無法判定')
-        else:
-            dip = cc.mean_dip(st['pairs'])
-            ok = cc.dip_ok(dip, expected)
-            self._record(results, PASS if ok else FAIL,
-                         f'{name_dip}:量到 {dip:+.1f}°,當地 {expected:+.1f}°'
-                         f'(標準 ±{cc.DIP_TOL_DEG:.0f}°)')
-            self._set_passed('mag_dip', ok)
 
     # -------------------------------------- environment / mounting precheck
 
@@ -1377,8 +1037,8 @@ class CalibrationMenu:
             if tilt <= cc.TILT_NOTE_DEG:
                 self._record(results, PASS, f'{name}:元件面朝上,傾斜 {tilt:.1f}°')
             elif tilt < 45.0:
-                self._record(results, NOTE, f'{name}:傾斜 {tilt:.1f}°。小角度可用選項 6 修正,'
-                             '或在 ROS 的 TF 設定安裝角度')
+                self._record(results, NOTE, f'{name}:傾斜 {tilt:.1f}°。小角度在車停水平地面做選項 2 '
+                             '時會一起扣掉,或在 ROS 的 TF 設定安裝角度')
             else:
                 self._record(results, NOTE, f'{name}:元件面沒有朝上(偏 {tilt:.0f}°),'
                              'ROS 的 TF 要設定安裝角度')
@@ -1406,7 +1066,7 @@ class CalibrationMenu:
             hints.append('振動大:IMU 沒有鎖緊,或太靠近馬達。鎖緊固定、靠近車體中心,'
                          '必要時加一層薄的減震墊。')
 
-    def _mag_precheck(self, report_only: bool = False, mounted: Optional[bool] = None,
+    def _mag_precheck(self, mounted: Optional[bool] = None,
                       notes_choice: Optional[str] = None) -> bool:
         """
         Check the surroundings and the mounting position from the IMU's own readings.
@@ -1448,23 +1108,20 @@ class CalibrationMenu:
                 self._verify_note('IMU 還沒裝上車:裝上去之後,要在最終位置重新檢查與校正。')
         except _VerifyQuit:
             self._out('已結束檢查。')
-            if report_only:
-                return True
             self._out('已取消校正,未送出任何指令。')
             return False
         except (serial.SerialException, OSError) as exc:
             logger.error('reading IMU data in the environment check failed: %s', exc)
             self._out(f'讀取 IMU 資料失敗:{exc}')
-            return report_only
+            return False
         finally:
-            self._verify_title = CHECK_TITLE
             self._check_cal = SoftwareCalibration()
         self._out((CLEAR_SCREEN if self._color else '') + '== 環境與安裝位置 檢查結果 ==')
         for status, text in results:
             self._out(self._mark(status, text))
         if any(text.startswith('4. 馬達干擾:') for _, text in results):
             self._out('馬達測完了:開始校正前,先讓馬達停止。')
-        if notes_choice is not None and not report_only:
+        if notes_choice is not None:
             self._show_notes(notes_choice)
         if not any(status == FAIL for status, _ in results):
             if any(status == SKIP for status, _ in results):
@@ -1475,8 +1132,6 @@ class CalibrationMenu:
         self._out('不適合的原因與改善方式:')
         for hint in hints:
             self._out(f'  - {hint}')
-        if report_only:
-            return True
         if not self._confirm('目前的環境或安裝位置不適合。仍要在這裡繼續校正嗎?'):
             self._out('已取消校正,未送出任何指令。')
             return False
@@ -1486,128 +1141,6 @@ class CalibrationMenu:
             return False
         self._out('依你的選擇,繼續校正。')
         return True
-
-    def calibration_check(self, items=('accel', 'gyro_still', 'gyro_turn', 'mag')) -> None:
-        """Run the reference-based checks; read-only."""
-        if self._key_ready is None:
-            self._out('校正檢測需要在終端機中執行(python3 imu.py → 4 IMU 校正工具)。')
-            return
-        self._verify_lines = []
-        self._verify_title = CHECK_TITLE
-        self._check_cal = self._load_existing()
-        for line in CHECK_INTRO:
-            self._verify_note(line)
-        if os.path.exists(str(self.config_path)):
-            self._verify_note(f'已套用軟體校正:{self.config_path}')
-        else:
-            self._verify_note('沒有軟體校正檔,以模組輸出判定。')
-        results: List[Tuple[str, str]] = []
-        steps = {'accel': self._check_accel, 'gyro_still': self._check_gyro_still,
-                 'gyro_turn': self._check_gyro_turn, 'mag': self._check_mag}
-        # Clear all requested results before starting, including steps that may
-        # never run because an earlier step is skipped or interrupted.
-        for item in items:
-            keys = ('mag_norm', 'mag_dip') if item == 'mag' else (item,)
-            self._check_passed.difference_update(keys)
-        self._done.discard('12')
-        try:
-            for item in items:
-                try:
-                    steps[item](results)
-                except ValueError as exc:
-                    logger.error('calibration check %s: bad data: %s', item, exc)
-                    self._record(results, SKIP, f'{ITEM_LABELS[item]}:資料異常,無法判定({exc})')
-        except (_VerifyQuit, KeyboardInterrupt):
-            self._out('已結束檢測。')
-        except (serial.SerialException, OSError) as exc:
-            logger.error('reading IMU data in the calibration check failed: %s', exc)
-            self._out(f'讀取 IMU 資料失敗:{exc}')
-        finally:
-            self._check_cal = SoftwareCalibration()
-        if not results:
-            return
-        self._out((CLEAR_SCREEN if self._color else '') + '== 檢測結果 ==')
-        for status, text in results:
-            self._out(self._mark(status, text))
-        if FAIL in [status for status, _ in results]:
-            for line in CHECK_FAIL_HINTS:
-                self._out(line)
-        passed = len(self._check_passed)
-        if passed == len(CHECK_ITEMS):
-            self._out(self._mark(PASS, f'{passed}/{len(CHECK_ITEMS)} 項全部合格:這顆 IMU 校正良好'))
-        else:
-            self._out(f'本次已合格 {passed}/{len(CHECK_ITEMS)} 項;五項都合格才算校正良好。')
-        self._step_ok = passed == len(CHECK_ITEMS)
-        if not self._step_ok:
-            self._done.discard('12')        # the latest check decides, not an earlier one
-        self._ask(BACK_TO_MENU)
-
-    def _attitude_free_view(self) -> None:
-        """Show live roll / pitch / yaw / height, optionally relative to a reference."""
-        for line in ATTITUDE_HELP:
-            self._out(line)
-        lock = threading.Lock()
-        state = {'angles': None, 'height': None, 'ref': None}
-        stop = threading.Event()
-        errors: List[BaseException] = []
-
-        def reader() -> None:
-            parser = wp.FrameParser()
-            next_status = self._time()
-            try:
-                while True:     # read at least once, even if 'q' comes immediately
-                    for p in self._read_stream(parser):
-                        with lock:
-                            if isinstance(p, wp.Angle):
-                                state['angles'] = (math.degrees(p.roll), math.degrees(p.pitch),
-                                                   math.degrees(p.yaw))
-                            elif isinstance(p, wp.Pressure):
-                                state['height'] = p.height_m
-                    now = self._time()
-                    if now >= next_status:
-                        with lock:
-                            angles, height, ref = state['angles'], state['height'], state['ref']
-                        self._status('等待角度資料...' if angles is None
-                                     else format_attitude(angles, height, ref))
-                        next_status = now + ATTITUDE_INTERVAL
-                    if stop.wait(READER_YIELD):
-                        break
-            except (serial.SerialException, OSError) as exc:
-                logger.error('reading IMU data in attitude view failed: %s', exc)
-                errors.append(exc)
-
-        thread = threading.Thread(target=reader, name='imu-attitude-view', daemon=True)
-        thread.start()
-        try:
-            while not errors:
-                cmd = self._ask('').lower()
-                if cmd == 'q':
-                    break
-                if self._color:
-                    # Keep a single updating line: undo the echoed line break.
-                    self._out(CURSOR_UP_CLEAR, end='', flush=True)
-                if cmd == 'r':
-                    with lock:
-                        state['ref'] = None
-                    if not self._color:
-                        self._out('已清除參考點,顯示目前值。')
-                elif cmd == '':
-                    with lock:
-                        angles, height = state['angles'], state['height']
-                        if angles is not None:
-                            state['ref'] = (angles, height)
-                    if angles is None:
-                        self._out('尚未收到角度資料,無法設定參考點。')
-                    elif not self._color:
-                        self._out('參考點已設定:' + format_attitude(angles, height))
-                else:
-                    self._out(f'無效的指令 {cmd!r}:Enter 設定參考點、r 清除、q 離開。')
-        finally:
-            stop.set()
-            thread.join(READER_JOIN_TIMEOUT)
-            self._end_status()
-        if errors:
-            self._out(f'讀取 IMU 資料失敗:{errors[0]}')
 
     def toggle_pressure_output(self) -> None:
         """Turn the 0x56 pressure / height output on or off (RSW bit 6, saved to flash)."""
@@ -1652,11 +1185,11 @@ class CalibrationMenu:
             self._unlock()
             self._send(wp.cmd_factory_reset())
         except (serial.SerialException, OSError):
-            self._out('重設指令失敗,硬體可能仍保留舊設定;請重新上電後用 12 檢測。')
+            self._out('重設指令失敗,硬體可能仍保留舊設定;請重新上電。')
             raise
         self._out('已送出恢復原廠設定指令;建議重新上電,並以預設 9600 baud 連線。')
         self._done.clear()               # every earlier calibration is gone
-        self._check_passed.clear()
+        self._refresh_mode()             # factory settings may use another algorithm
 
     # ------------------------------------------------------------ main loop
 
@@ -1669,10 +1202,23 @@ class CalibrationMenu:
         for line in notes:
             self._out(line)
 
+    def _refresh_mode(self) -> None:
+        """Read which algorithm the module runs, so the menu shows only what it needs."""
+        try:
+            self._axis6 = self._read_axis6()
+        except (serial.SerialException, OSError) as exc:
+            logger.error('reading the algorithm setting failed: %s', exc)
+            self._axis6 = None
+
     def run(self) -> int:
         """Run the menu loop and return a process exit code."""
+        try:
+            self._refresh_mode()
+        except KeyboardInterrupt:
+            self._out('\n已中斷,離開。')
+            return 130
         while True:
-            self._out(render_menu(self._done, self._color))
+            self._out(render_menu(self._done, self._color, self._axis6))
             try:
                 choice = self._ask('請選擇: ')
             except EOFError:
@@ -1685,7 +1231,10 @@ class CalibrationMenu:
                 return 0
             action = self._actions.get(choice)
             if action is None:
-                self._out(f'無效的選項:{choice!r},請輸入 0-13。')
+                self._out(f'無效的選項:{choice!r},請輸入 0-12。')
+                continue
+            if choice in HIDDEN_BY_MODE.get(self._axis6, ()):
+                self._out(HIDDEN_REASON[self._axis6])
                 continue
             self._show_notes(choice)
             self._step_ok = False
@@ -1703,33 +1252,23 @@ class CalibrationMenu:
                 self._out(f'操作失敗:{exc}')
 
 
-def wrap_degrees(value: float) -> float:
-    """Wrap an angle in degrees to [-180, 180)."""
-    return (value + 180.0) % 360.0 - 180.0
-
-
-def format_attitude(angles, height: Optional[float], ref=None) -> str:
+def render_menu(done=(), color: bool = False, axis6: Optional[int] = None) -> str:
     """
-    Format roll / pitch / yaw (degrees) and height (m) as one status line.
+    Return the menu for the algorithm ``axis6`` with the rows in ``done`` marked.
 
-    With ``ref = ((roll, pitch, yaw), height)`` the line shows the change
-    relative to the reference instead (angles wrapped to +-180 degrees).
+    Rows the algorithm cannot use are left out (see HIDDEN_BY_MODE); done rows
+    are green on a terminal.
     """
-    r, p, y = angles
-    if ref is None:
-        h = '高度 (未輸出)' if height is None else f'高度 {height:+7.2f} m'
-        return f'roll(X) {r:+7.2f}°  pitch(Y) {p:+7.2f}°  yaw(Z) {y:+7.2f}°  {h}'
-    (r0, p0, y0), h0 = ref
-    dr, dp, dy = (wrap_degrees(a - b) for a, b in ((r, r0), (p, p0), (y, y0)))
-    dh = 'Δ高度 (未輸出)' if height is None or h0 is None else f'Δ高度 {height - h0:+7.2f} m'
-    return f'Δroll(X) {dr:+7.2f}°  Δpitch(Y) {dp:+7.2f}°  Δyaw(Z) {dy:+7.2f}°  {dh}'
-
-
-def render_menu(done=(), color: bool = False) -> str:
-    """Return the menu with the rows in ``done`` marked (green on a terminal)."""
+    hidden = HIDDEN_BY_MODE.get(axis6, ())
     lines = []
     for line in MENU.split('\n'):
+        if 'CMP10A IMU 校正工具' in line:
+            line = f'===== CMP10A IMU 校正工具(目前:{MODE_NAMES.get(axis6, "模式未知")})====='
+        if line.startswith(' 0. '):
+            lines.append(HIDDEN_NOTE.get(axis6, HIDDEN_NOTE[None]))
         match = _MENU_ROW.match(line)
+        if match and match.group(1) in hidden:
+            continue
         if match and match.group(1) in done:
             line = f'{line}  {DONE_MARK}'
             if color:
