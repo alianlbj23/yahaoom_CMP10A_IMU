@@ -194,6 +194,56 @@ def test_field_change_needs_data():
         cc.field_change([], [(1.0, 0.0, 0.0)])
 
 
+def test_rest_change_compares_the_two_resting_places():
+    start = [(4000.0, 0.0, 0.0)] * 10
+    assert cc.rest_change(start, [(4000.0, 0.0, 0.0)] * 10) == pytest.approx(0.0)
+    assert cc.rest_change(start, [(4000.0, 400.0, 0.0)] * 10) == pytest.approx(0.1)
+
+
+def test_rest_change_needs_both_places():
+    with pytest.raises(ValueError):
+        cc.rest_change([], [(1.0, 0.0, 0.0)])
+    with pytest.raises(ValueError):
+        cc.rest_change([(1.0, 0.0, 0.0)], [])
+    with pytest.raises(ValueError):
+        cc.rest_change([(0.0, 0.0, 0.0)], [(1.0, 0.0, 0.0)])
+
+
+def test_net_rotation_follows_a_turn():
+    net = cc.NetRotation()
+    for i in range(11):                       # 2.5 deg/s about Z for 1 s
+        net.add(i * 0.1, (0.0, 0.0, math.radians(2.5)))
+    assert net.angle_deg == pytest.approx(2.5)
+
+
+def test_net_rotation_ignores_a_wobble_that_comes_back():
+    net, meter = cc.NetRotation(), cc.RotationMeter()
+    rates = [math.radians(20.0)] * 10 + [math.radians(-20.0)] * 10
+    for i, rate in enumerate(rates):
+        net.add(i * 0.1, (rate, 0.0, 0.0))
+        meter.add(i * 0.1, (rate, 0.0, 0.0))
+    assert net.angle_deg == pytest.approx(0.0, abs=1e-6)
+    assert meter.total_deg == pytest.approx(38.0)     # 19 intervals of 2 deg, any direction
+
+
+def test_net_rotation_skips_gaps():
+    net = cc.NetRotation()
+    net.add(0.0, (0.0, 0.0, 1.0))
+    net.add(cc.MAX_GAP_S + 1.0, (0.0, 0.0, 1.0))
+    assert net.angle_deg == 0.0
+
+
+def test_turning_explains_part_of_the_slide_change():
+    """Regression: turning 3 deg alone moves the reading 5.2 % and failed the 5 % limit."""
+    assert cc.rotation_allowance(3.0) == pytest.approx(2 * math.sin(math.radians(1.5)))
+    assert cc.rotation_allowance(0.0) == 0.0
+    expected = cc.ENV_CHANGE_TOL + cc.rotation_allowance(3.0)
+    assert cc.slide_change_tol(3.0) == pytest.approx(expected)
+    assert cc.slide_change_ok(0.052, 3.0)
+    assert not cc.slide_change_ok(0.052, 0.0)
+    assert not cc.slide_change_ok(0.12, 2.5)          # turning cannot hide iron
+
+
 def test_rotation_meter_adds_up_turning_on_any_axis():
     meter = cc.RotationMeter()
     for i in range(11):                       # 10 deg/s about Y for 1 s

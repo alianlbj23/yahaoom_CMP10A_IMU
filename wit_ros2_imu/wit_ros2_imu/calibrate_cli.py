@@ -157,6 +157,7 @@ SLIDE_DISTANCE_CM = 30
 MOTOR_BASE_S = 3.0
 MOTOR_RUN_S = 5.0
 SLIDE_MOVE_ACCEL = 0.15       # m/s^2 away from the resting reading = the IMU is being slid
+SLIDE_RECENT = 5              # latest mag samples shown while the IMU is still moving
 MOTOR_DETECT_VIB = 0.1        # m/s^2 std of |a| (and 3x the stopped value) = motors running
 MOTOR_DETECT_CHANGE = 0.02    # field change vs. stopped (2x the rest noise) = motors running
 MOTOR_SETTLE_S = 1.0          # wait after the motors are detected before recording
@@ -1204,7 +1205,8 @@ class CalibrationMenu:
 
         def restart():
             st.update(phase='wait', hold=None, ref_acc=[], ref=[], ref_gyro=[], mags=[],
-                      moved=False, rest=None, meter=None, bias=(0.0, 0.0, 0.0))
+                      end=[], moved=False, rest=None, meter=None, net=None,
+                      bias=(0.0, 0.0, 0.0))
         restart()
 
         def on_packet(p, now):
@@ -1214,7 +1216,9 @@ class CalibrationMenu:
                 if st['phase'] == 'wait' and st['hold'] is not None:
                     st['ref_gyro'].append(vec)
                 if st['meter'] is not None:
-                    turned = st['meter'].add(now, [a - b for a, b in zip(vec, st['bias'])])
+                    rate = [a - b for a, b in zip(vec, st['bias'])]
+                    st['net'].add(now, rate)
+                    turned = st['meter'].add(now, rate)
                     if not cc.slide_valid(turned):
                         st['retries'] += 1
                         st['last_turn'] = turned
@@ -1240,9 +1244,12 @@ class CalibrationMenu:
                         st['bias'] = tuple(sum(g[i] for g in st['ref_gyro']) / n
                                            for i in range(3))
                     st['meter'] = cc.RotationMeter()
+                    st['net'] = cc.NetRotation()
                 return
             if isinstance(p, wp.Mag):
                 st['mags'].append(vec)
+                if st['rest'] is not None:
+                    st['end'].append(vec)             # at rest in the new place
                 return
             n = float(len(st['ref_acc']))
             ref = [sum(a[i] for a in st['ref_acc']) / n for i in range(3)]
@@ -1250,24 +1257,26 @@ class CalibrationMenu:
             if away or not still:
                 st['moved'] = st['moved'] or away
                 st['rest'] = None
+                st['end'] = []
             elif st['moved'] and st['rest'] is None:
                 st['rest'] = now
 
         def done(now):
             return (st['phase'] == 'slide' and st['moved'] and st['rest'] is not None
-                    and now - st['rest'] >= STILL_HOLD_S)
+                    and now - st['rest'] >= STILL_HOLD_S and len(st['end']) >= 3)
 
         def status(now):
             if st['phase'] == 'wait':
                 again = (f'  上次轉了 {st["last_turn"]:.0f}°,不算;停住後自動重來'
                          if st['retries'] else '')
                 return f'放著不動,準備中...{again}'
-            change = cc.field_change(st['ref'], st['mags'])
-            turned = st['meter'].total_deg if st['meter'] is not None else 0.0
+            change = cc.rest_change(st['ref'], st['end'] or st['mags'][-SLIDE_RECENT:])
             if not st['moved']:
                 return f'準備好了:不要轉動,開始平移  磁場變化 {change:.1%}'
+            tol = cc.slide_change_tol(st['net'].angle_deg)
             state = '停住了,確認中...' if st['rest'] is not None else '平移中...'
-            return f'{state}  磁場變化 {change:.1%}  已轉動 {turned:.1f}°'
+            return (f'{state}  磁場變化 {change:.1%}(標準 {tol:.1%} 內)  '
+                    f'已轉動 {st["meter"].total_deg:.1f}°/{cc.SLIDE_MAX_ROTATION_DEG:.0f}°')
 
         prompt = (f'環境 2/2 平移:IMU(或整台車)放在起點不動,等畫面顯示「準備好了」,'
                   f'不要轉動,沿桌面或地面平移約 {SLIDE_DISTANCE_CM} cm 再停住。全程自動'
@@ -1280,10 +1289,13 @@ class CalibrationMenu:
             if cmd is None or (st['phase'] == 'slide' and st['moved']):
                 break
             self._out('還沒偵測到平移;準備好了之後,不要轉動地移動 IMU。')
-        change = cc.field_change(st['ref'], st['mags'])
-        ok = cc.change_ok(change)
+        # Only the two resting places count; a stop that never settled has no end data.
+        change = cc.rest_change(st['ref'], st['end'])
+        net = st['net'].angle_deg
+        ok = cc.slide_change_ok(change, net)
         self._record(results, PASS if ok else FAIL,
-                     f'{name}:平移時磁場變化 {change:.1%}(標準 {cc.ENV_CHANGE_TOL:.0%} 內)')
+                     f'{name}:平移前後變化 {change:.1%}'
+                     f'(標準 {cc.slide_change_tol(net):.1%} 內,含淨轉動 {net:.1f}°)')
         if not ok:
             hints.append('平移時磁場跟著位置改變:附近有鐵件(鐵桌、鐵櫃、筆電、含鋼筋的地板)。'
                          '換到木桌或空曠處,或把 IMU 墊高遠離地面。')

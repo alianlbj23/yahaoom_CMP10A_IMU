@@ -1290,6 +1290,40 @@ def test_slide_that_turns_starts_over_by_itself(clock, tmp_path):
     assert '[合格] 2. 附近有無鐵件' in run.text
 
 
+def _turned_mag(deg, scale=1.0):
+    """Return the field seen after the IMU turned ``deg`` about Z, ``scale`` times as strong."""
+    t = math.radians(deg)
+    return (4000 * scale * math.cos(t), -4000 * scale * math.sin(t), 0)
+
+
+TURNING_SLIDE = _env_stream(gyro=_gyro_frame(0, 0, 2.5), accel=(0.6, 0.0, G0))
+
+
+def test_slide_with_a_small_turn_is_not_blamed_on_iron(clock, tmp_path):
+    """Regression: a 2.5 deg turn alone moves the reading 4.4 %, close to the 5 % limit."""
+    end = _env_stream(mag=_turned_mag(2.5, scale=1.03))       # 3 % stronger, 5.4 % in all
+    slide = [(0.0, STEADY), (2.5, TURNING_SLIDE), (3.5, end)]
+    run = _Check(clock, tmp_path, [(STEADY, None, 0), (slide, None, 0)], menu=['3', 'n', 'n'])
+    assert '[合格] 2. 附近有無鐵件' in run.text
+    assert '淨轉動 2.' in run.text
+
+
+def test_turning_does_not_hide_iron_at_the_new_place(clock, tmp_path):
+    end = _env_stream(mag=_turned_mag(2.5, scale=1.12))       # 12 % stronger
+    slide = [(0.0, STEADY), (2.5, TURNING_SLIDE), (3.5, end)]
+    run = _Check(clock, tmp_path, [(STEADY, None, 0), (slide, None, 0)], menu=['3', 'n', 'n'])
+    assert '[不合格] 2. 附近有無鐵件' in run.text
+
+
+def test_slide_ignores_readings_taken_while_moving(clock, tmp_path):
+    """Regression: hand wobble during the push counted as a field change."""
+    wobble = (_env_stream(mag=(4000, 400, 0), accel=(0.6, 0.0, G0))
+              + _env_stream(mag=(4000, -400, 0), accel=(0.6, 0.0, G0)))
+    run = _Check(clock, tmp_path, [(STEADY, None, 0), (_slide(moving=wobble), None, 0)],
+                 menu=['3', 'n', 'n'])
+    assert '[合格] 2. 附近有無鐵件' in run.text
+
+
 def test_slide_finishes_without_any_key(clock, tmp_path):
     run = _Check(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
     assert '準備好了:不要轉動,開始平移' in run.text

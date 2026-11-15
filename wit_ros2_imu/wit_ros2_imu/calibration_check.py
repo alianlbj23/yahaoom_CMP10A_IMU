@@ -322,6 +322,87 @@ def slide_valid(rotation_deg: float) -> bool:
     return rotation_deg <= SLIDE_MAX_ROTATION_DEG
 
 
+def _quat_mul(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float, float]:
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw)
+
+
+class NetRotation:
+    """
+    Follow the net rotation from gyro samples (rad/s), as one angle.
+
+    Unlike RotationMeter, a wobble that comes back adds nothing: only how far
+    the IMU ends up turned from where it started counts.
+    """
+
+    def __init__(self):
+        """Start unturned."""
+        self._q = (1.0, 0.0, 0.0, 0.0)
+        self._last = None
+
+    def add(self, t: float, rate_xyz: Sequence[float]) -> float:
+        """Add one sample taken at time ``t``; return the net angle in degrees."""
+        rate = tuple(float(c) for c in rate_xyz)
+        if self._last is not None:
+            t0, r0 = self._last
+            dt = t - t0
+            if 0.0 < dt <= MAX_GAP_S:
+                mid = [(a + b) / 2.0 for a, b in zip(r0, rate)]
+                speed = _norm(mid)
+                if speed > 0.0:
+                    half = speed * dt / 2.0
+                    s = math.sin(half) / speed
+                    self._q = _quat_mul(self._q, (math.cos(half), mid[0] * s,
+                                                  mid[1] * s, mid[2] * s))
+        self._last = (t, rate)
+        return self.angle_deg
+
+    @property
+    def angle_deg(self) -> float:
+        """Net angle turned so far, in degrees."""
+        n = _norm(self._q)
+        return math.degrees(2.0 * math.acos(min(1.0, abs(self._q[0]) / n)))
+
+
+def rest_change(start: Sequence[Sequence[float]], end: Sequence[Sequence[float]]) -> float:
+    """
+    Return how far the mean field at rest moved between two places, as a fraction.
+
+    Only readings taken at rest are compared, so hand wobble and sensor noise
+    while the IMU is being pushed do not count.
+    """
+    ref = _mean3(start)
+    ref_norm = _norm(ref)
+    if ref_norm <= 0:
+        raise ValueError('magnetometer reads zero')
+    moved = _mean3(end)
+    return _norm([a - b for a, b in zip(moved, ref)]) / ref_norm
+
+
+def rotation_allowance(net_deg: float) -> float:
+    """
+    Return the most a turn of ``net_deg`` can move the field reading, as a fraction.
+
+    Turning by an angle moves a fixed vector by at most 2 sin(angle / 2) of its
+    length (when the turn axis is at right angles to the field).
+    """
+    return 2.0 * math.sin(math.radians(abs(net_deg)) / 2.0)
+
+
+def slide_change_tol(net_deg: float) -> float:
+    """Return the slide limit: ENV_CHANGE_TOL plus what the turn alone can explain."""
+    return ENV_CHANGE_TOL + rotation_allowance(net_deg)
+
+
+def slide_change_ok(change: float, net_deg: float) -> bool:
+    """Return True if the field change after a slide is within slide_change_tol."""
+    return change <= slide_change_tol(net_deg)
+
+
 def tilt_deg(accel: Sequence[float]) -> float:
     """Return the angle between the IMU's +Z axis and straight up, in degrees."""
     n = _norm(accel)
