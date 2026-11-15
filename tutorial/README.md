@@ -2,11 +2,13 @@
 
 把 IMU 裝進自走車要會的事,共 7 頁,每頁一件事。
 
+本教材以**室內自走車**為例,IMU 用**六軸模式**(不用磁力計)。原因見第 1 頁與第 7 頁。
+
 ## 這個裝置能做什麼
 
 - 量**轉多快**:車子轉彎的角速度
 - 量**有多斜**:車身的傾斜(roll、pitch)
-- 量**朝哪邊**:車頭方向(yaw),以磁北為準
+- 量**朝哪邊**:車頭方向(yaw)。六軸模式下,開機時的方向就是 0
 - 量**高度變化**:氣壓計(預設關閉)
 
 自走車主要用第一項:輪子打滑時,IMU 仍然知道車子轉了多少。
@@ -14,7 +16,7 @@
 ## 它不能做什麼
 
 - 不能單獨算出位置(誤差累積太快)
-- 靠近馬達、鐵件時,「朝哪邊」會不準
+- 六軸的 yaw 會慢慢漂,長時間的方向要靠 LiDAR 對地圖修正
 
 ## 照順序做
 
@@ -25,8 +27,9 @@
 | 2 | 讀出資料 | [02-read-data.md](02-read-data.md) |
 | 3 | 決定裝在哪 | [03-mounting.md](03-mounting.md) |
 | 4 | 校正 | [04-calibration.md](04-calibration.md) |
-| 5 | 確認校正成功 | [05-verification.md](05-verification.md) |
+| 5 | 什麼時候要重新校正 | [05-recalibration.md](05-recalibration.md) |
 | 6 | 接進 ROS 2 | [06-ros2.md](06-ros2.md) |
+| 7 | 磁力計觀念 FAQ | [07-magnetometer-faq.md](07-magnetometer-faq.md) |
 
 ## 需要準備
 
@@ -34,6 +37,5 @@
 - 筆電(Linux 或 Windows + WSL2),已裝 Docker
 - 先執行 `python3 imu.py` 選 `1` 下載映像(約 2 GB)
 - 工具有更新時,在 repo 資料夾執行 `git pull` 即可,不用重新下載映像
-- 水平儀(手機 app)、方形盒子、一塊小鐵片
+- 水平儀(手機 app)
 
-授課者另見 [instructor-notes.md](instructor-notes.md)。
