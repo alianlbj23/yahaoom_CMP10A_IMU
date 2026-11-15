@@ -180,6 +180,62 @@ MAG_COVERAGE_TARGET = 0.85   # fraction of the full +-|B| swing that counts as "
 AXIS_NAMES = ('X', 'Y', 'Z')
 
 
+PLANE_SECTORS = 12            # 30 deg sectors around the centre of each plane
+PLANE_SECTORS_NEEDED = 11     # a plane counts as one full turn at 330 deg
+PLANE_MIN_RADIUS = 0.3        # ignore points closer than this share of the plane's radius
+
+
+class PlaneCoverage:
+    """
+    Per-plane progress of a magnetometer calibration, like the official MagCal charts.
+
+    The WitMotion PC software shows the XY, XZ and YZ projections of the
+    magnetometer readings and asks for one to three turns in each plane until
+    a regular ellipse is drawn.  Here a plane counts as done once its
+    projection has gone round the (running) centre: PLANE_SECTORS_NEEDED of
+    PLANE_SECTORS sectors visited.  A plane name 'XZ|YZ' accepts either.
+    """
+
+    def __init__(self, planes):
+        """``planes``: required plane names such as ('XY', 'XZ', 'YZ') or ('XZ|YZ',)."""
+        self.planes = tuple(planes)
+        self._points: List[Vector3] = []
+        self.samples = 0
+
+    def add(self, mag: Mag) -> None:
+        """Record one magnetometer sample; non-finite samples are ignored."""
+        values = (mag.x, mag.y, mag.z)
+        if all(math.isfinite(v) for v in values):
+            self._points.append(tuple(float(v) for v in values))
+            self.samples += 1
+
+    def _single(self, plane: str) -> float:
+        if not self._points:
+            return 0.0
+        i, j = 'XYZ'.index(plane[0]), 'XYZ'.index(plane[1])
+        ci = (max(p[i] for p in self._points) + min(p[i] for p in self._points)) / 2.0
+        cj = (max(p[j] for p in self._points) + min(p[j] for p in self._points)) / 2.0
+        vecs = [(p[i] - ci, p[j] - cj) for p in self._points]
+        radius = max(math.hypot(a, b) for a, b in vecs)
+        if radius <= 0:
+            return 0.0
+        filled = {int((math.atan2(b, a) + math.pi) / (2 * math.pi) * PLANE_SECTORS) % PLANE_SECTORS
+                  for a, b in vecs if math.hypot(a, b) >= PLANE_MIN_RADIUS * radius}
+        return min(1.0, len(filled) / PLANE_SECTORS_NEEDED)
+
+    def progress(self, plane: str) -> float:
+        """Return the progress of one required plane in [0, 1]."""
+        return max(self._single(p) for p in plane.split('|'))
+
+    def missing(self) -> List[str]:
+        """Names of the required planes that are not yet done."""
+        return [p for p in self.planes if self.progress(p) < 1.0]
+
+    def complete(self) -> bool:
+        """Return True once every required plane is done."""
+        return not self.missing()
+
+
 class MagCoverage:
     """
     Per-axis progress of a magnetometer calibration, from the magnetometer itself.

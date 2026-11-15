@@ -2,7 +2,7 @@
 
 ## 目標
 在 Linux / WSL2 / macOS 上,以單一 Docker 映像(ROS 2 Jazzy)讀取 Yahboom 10 軸 IMU (CMP10A),
-提供 RViz2 與 Foxglove(經 rosbridge 或 foxglove_bridge)可視化,並提供硬體 + 軟體校正工具。
+提供 RViz2 與 Foxglove(經 rosbridge 或 foxglove_bridge)可視化,並提供照官方步驟(WitMotion 使用說明 v23-0529 §3.3)的校正工具與校正驗證。
 使用者透過主機端 Python 互動選單腳本 `imu.py` 進入/操作 docker。
 
 ## 已驗證的硬體事實(2026-11-09 實機)
@@ -26,7 +26,7 @@
 指令(寫暫存器 `FF AA <reg> <lo> <hi>`):
 - unlock `FF AA 69 88 B5`(10 秒內要完成後續指令);save `FF AA 00 00 00`;factory reset `FF AA 00 01 00`
 - CALSW (0x01):0x00 正常、0x01 加速度計校正、0x03 高度歸零、0x04 航向角(Z)歸零、
-  0x07 磁力計校正(球面擬合)、0x08 設定角度參考、0x09 磁力計校正(雙平面)
+  0x07 磁力計校正(橢球)、0x08 設定角度參考、0x09 磁力計校正(雙平面)
 - RSW (0x02) bit: ACC=1, GYRO=2, ANGLE=3, MAG=4, PRESS=6, QUATER=9
 - RRATE (0x03):0x06=10Hz, 0x07=20Hz, 0x08=50Hz, 0x09=100Hz
 - 偏移暫存器(唯讀檢視):AXOFFSET 0x05 … GZOFFSET 0x0A, HXOFFSET 0x0B … HZOFFSET 0x0D
@@ -38,10 +38,10 @@ host/serial_tcp_bridge.py       # 主機端 serial→TCP 橋接 (macOS 用;需 p
 tests/                          # 主機端腳本測試 (pytest)
 docker/Dockerfile               # FROM ros:jazzy-ros-base
 docker/entrypoint.sh
-config/                         # 掛載到容器 /config(軟體校正 YAML)
+config/                         # 掛載到容器 /config(舊版軟體偏移 YAML)
 wit_ros2_imu/                   # ROS 2 ament_python 套件
   wit_ros2_imu/wit_protocol.py  # 純 Python(不 import rclpy)
-  wit_ros2_imu/calibration.py   # 純 Python 軟體校正模型
+  wit_ros2_imu/calibration.py   # 純 Python 軟體偏移模型、磁力計平面進度
   wit_ros2_imu/calibrate_cli.py # 互動校正選單(直接開序列埠,不需 ROS)
   wit_ros2_imu/wit_ros2_imu.py  # ROS 2 driver node
   launch/imu.launch.py
@@ -94,16 +94,20 @@ mag_offset: [x, y, z]    # raw LSB
 ### `calibrate_cli.py`(console script `imu_calibrate`)
 參數:`--port`(可為 pyserial URL,例如 `socket://host.docker.internal:5760`)、`--baud`、`--config`(YAML 路徑)。
 互動選單(stdlib `input()`):
-1. 即時資料檢視 2. 加速度計水平校正(硬體) 3. 磁力計校正 球面擬合(硬體) 4. 磁力計校正 雙平面(硬體)
-5. Z 軸航向歸零(硬體) 6. 設定角度參考(硬體) 7. 高度歸零(硬體,氣壓計) 8. 讀取 IMU 內部偏移暫存器
-9. 軟體靜態偏移校正(gyro/accel → YAML) 10. 軟體磁力計 hard-iron 校正(→ YAML) 11. 恢復原廠設定 12. 校正檢測 / 姿態檢視(唯讀;Enter 為以外部參考判定的五項檢測,規格見 docs/CALIBRATION_CHECK.md;f 為可設參考點看 Δ 的姿態檢視) 13. 氣壓高度輸出 開啟/關閉(RSW bit 6) 0. 離開
+1. 即時資料檢視 2. 加速度計水平校正(硬體) 3. 磁力計校正 橢球(硬體) 4. 磁力計校正 雙平面(硬體)
+5. Z 軸角度歸零(硬體,僅六軸) 6. 設定角度參考(硬體) 7. 高度歸零(硬體,氣壓計) 8. 讀取 IMU 內部偏移暫存器
+9. 陀螺儀自動校正 狀態(唯讀,0x61/0x63) 10. 演算法 六軸 / 九軸 切換(AXIS6 0x24) 11. 恢復原廠設定 12. 校正驗證(最後一步)/ 姿態檢視(唯讀;Enter 為以外部參考判定的五項檢測,規格見 docs/CALIBRATION_CHECK.md;f 為可設參考點看 Δ 的姿態檢視) 13. 氣壓高度輸出 開啟/關閉(RSW bit 6) 0. 離開
 - 任何寫入 flash 前都要求使用者確認 (y/N)
 - 硬體指令流程:unlock → CALSW → (等待/使用者操作) → CALSW NORMAL → save
 - 磁力計硬校無有效資料不開始;過程無資料、讀取失敗或中斷時嘗試 NORMAL 且不 SAVE。部分涵蓋須額外確認(預設否),不標完成;SAVE 前重檢解鎖。
 - 硬體 SAVE 或原廠重設前,先原子地將對應 YAML 殘差寫為零向量並保留其他欄位:加速度校正清 accel_bias、磁校清 mag_offset、原廠重設清全部。事前說明且拒絕操作損壞的 YAML;寫檔失敗不送 SAVE 或重設指令,要求重新上電。
-- 軟體靜態校正須收滿50筆並檢查明顯旋轉、加速度變動與水平;磁校須同時達到磁場相對跨度與獨立重力方向涵蓋。取樣不合格或 YAML 損壞均不覆寫。
-- 軟體磁校扣除擬合中心後,場強須通過 calibration_check 既有的 magnitude_ok 門檻,否則拒存。仍須用選項12與新資料驗證。
-- 校正改變後舊檢測結果失效;重測先撤銷受測項目舊結果。涵蓋進度是提示,軟體偏移不會改模組輸出的 orientation。
+- 步驟與等待時間照官方:加速度計靜止 2 秒,完成後顯示讀數(應約 0、0、1 g、角度約 0°)。
+- 磁力計進度以平面計:每個平面 12 等分方向,轉過 11 格為滿。橢球需 XY、XZ、YZ;雙平面先 XY(水平),再 XZ 或 YZ(垂直),第 1 段滿自動進入第 2 段。雙平面開始前讀加速度,傾斜超過 15° 不開始。
+- Z 軸歸零先讀 AXIS6:九軸拒絕;讀不到時說明並再確認。角度參考先顯示官方警告(與加速度計校正同時使用可能異常)。
+- 陀螺儀自動校正只讀不寫:不同型號的 0x63 意義不同,這顆模組的開關指令未確認。
+- 演算法切換:讀 AXIS6 → 確認 → unlock → 寫入 → save → 讀回;讀回相符才標完成。
+- 不再寫入軟體偏移;舊 YAML 仍由 driver 與選項 12 套用,硬體校正會清除對應欄位。
+- 校正改變後舊檢測結果失效;重測先撤銷受測項目舊結果。進度是提示,品質由選項 12 判定。
 - 序列埠開啟設 timeout;錯誤訊息清楚並以非 0 結束
 
 ### `wit_ros2_imu.py`(ROS 2 node,executable `wit_ros2_imu`)

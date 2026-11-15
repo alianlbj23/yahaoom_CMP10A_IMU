@@ -37,9 +37,8 @@ import serial
 
 from . import calibration_check as cc
 from . import wit_protocol as wp
-from .calibration import (compute_mag_offset, compute_static_bias, load_calibration,
-                          MAG_COVERAGE_TARGET, MagCoverage, MIN_SAMPLES, save_calibration,
-                          SoftwareCalibration)
+from .calibration import (load_calibration, MAG_COVERAGE_TARGET, MagCoverage, PlaneCoverage,
+                          save_calibration, SoftwareCalibration)
 
 logger = logging.getLogger(__name__)
 
@@ -52,26 +51,37 @@ READ_CHUNK = 64
 CMD_GAP = 0.1               # s between consecutive commands
 UNLOCK_WINDOW = 10.0        # s the device stays unlocked
 UNLOCK_MARGIN = 2.0         # re-unlock if less than this is left
-ACCEL_CAL_WAIT = 5.0        # s to hold still during accelerometer calibration
+# The steps below follow the WitMotion PC software and its manual
+# (software instructions v23-0529, section 3.3 "Sensor calibration").
+ACCEL_CAL_WAIT = 2.0        # s; official prompt: "keep the sensor still for 2 seconds"
 SHORT_CAL_WAIT = 1.0        # s for heading / angle-reference / height zeroing
 REPLY_TIMEOUT = 1.5         # s to wait for a 0x5F register reply
-STATIC_SAMPLES = 50         # accel + gyro samples for software static calibration
-STATIC_TIMEOUT = 20.0
-SOFT_MAG_TIMEOUT = 90.0     # s; software hard-iron sampling ends earlier once all axes are covered
-SOFT_MAG_COVERAGE_TARGET = 0.95   # auto-stop needs both extremes for (max+min)/2
-# Dual-plane turns keep one axis in the horizontal plane, where it only sees
-# the horizontal part of the inclined geomagnetic field: cos(inclination) of
-# the full swing (about 0.80 in Taiwan).  0.70 stays reachable up to 45 deg.
-DUAL_PLANE_COVERAGE_TARGET = 0.70
-DUAL_PLANE_STEPS = [
-    '開始後請先將 IMU(連同機器人)水平繞 Z 軸緩慢轉一圈,再立起繞 X 或 Y 軸轉一圈;',
-    '若不確定,繞三軸緩慢轉動即可。',
-    '雙平面的轉法掃不滿每一軸的全部範圍,進度條已依此放寬;',
-    '已照上述方式轉完但進度卡住時,按 Enter 後可另行確認儲存,再用選項 12 驗證。',
-    '進度長時間不動,通常是附近有鐵件或電器干擾,請移開後重做。',
+LEVEL_MAX_TILT_DEG = 15.0   # official dual-plane rule: tilt must not exceed 15 deg
+READBACK_TIME = 1.0         # s of data shown after the accelerometer calibration
+REG_AXIS6 = 0x24            # algorithm: 0 = 9-axis (absolute heading), 1 = 6-axis
+REG_GYROCALITHR = 0x61      # gyro auto-calibration threshold; 0x63 GYROCALTIME follows
+SPHERE_STEPS = [
+    '官方步驟:',
+    '  1. 先用手機在水平面轉幾圈,找出南北方向。',
+    '  2. 開始後,沿南北方向的垂直面,讓 XZ、YZ、XY 三個平面各轉 1–3 圈。',
+    '  3. 三個平面的進度都滿,出現 [完成] 後按 Enter,寫入參數。',
 ]
+DUAL_PLANE_STEPS = [
+    '官方步驟:',
+    '  1. 先把 IMU 水平放好(傾斜不可超過 15°)。',
+    '  2. 開始後,保持水平,慢慢轉一圈。',
+    '  3. 再把 IMU 垂直立起來,慢慢轉一圈。',
+    '  4. 出現 [完成] 後按 Enter,寫入參數。',
+]
+# Stages of the magnetometer progress display: (instruction, required planes).
+MAG_STAGES = {
+    wp.CalMode.MAG_SPHERE: [('三個平面各轉 1–3 圈', ('XY', 'XZ', 'YZ'))],
+    wp.CalMode.MAG_DUAL_PLANE: [('第 1 段:保持水平,慢慢轉一圈', ('XY',)),
+                                ('第 2 段:垂直立起來,慢慢轉一圈', ('XZ|YZ',))],
+}
+PLANE_LABEL = {'XZ|YZ': '垂直'}
+PLANE_BAR_WIDTH = 6          # three plane bars must fit in 79 columns
 FIELD_MEASURE_TIME = 1.5    # s of normal-mode data used to measure |B| before a mag calibration
-LARGE_ACCEL_BIAS = 1.0      # m/s^2; above this the IMU was probably not level
 
 # Progress display
 STATUS_INTERVAL = 0.5       # s between progress-line refreshes
@@ -99,16 +109,16 @@ MENU = """
 ========== CMP10A IMU 校正工具 ==========
  1. 即時資料檢視                          → 任何地方
  2. 加速度計水平校正(硬體)                → 水平桌面、靜止,高度不拘
- 3. 磁力計校正 球面擬合(硬體)             → 最終安裝位置、實際使用環境
- 4. 磁力計校正 雙平面(硬體)               → 最終安裝位置(機器人無法三軸翻轉時)
- 5. Z 軸航向歸零(硬體)                    → 最終位置,對準正前方
+ 3. 磁力計校正 橢球(硬體)                 → 離電腦 50 cm,拿在空中轉
+ 4. 磁力計校正 雙平面(硬體)               → 先水平、再垂直,各轉一圈
+ 5. Z 軸角度歸零(硬體,僅六軸)             → 靜止放置
  6. 設定角度參考(硬體)                    → 裝好後,機器人放水平地面
  7. 高度歸零(硬體,氣壓計)                 → 在要當作 0 m 的高度
  8. 讀取 IMU 內部偏移暫存器               → 任何地方(唯讀)
- 9. 軟體靜態偏移校正(gyro/accel → YAML)   → 暖機 5 分鐘後、水平靜止
-10. 軟體磁力計 hard-iron 校正(→ YAML)     → 最終安裝位置,三軸各轉滿一圈
+ 9. 陀螺儀自動校正 狀態(唯讀)             → 任何地方
+10. 演算法 六軸 / 九軸 切換               → 寫入 IMU 設定
 11. 恢復原廠設定                          → 任何地方
-12. 校正檢測 / 姿態檢視                   → 任何地方(唯讀),判定校正是否合格
+12. 校正驗證(最後一步)/ 姿態檢視          → 全部校正完後,判定是否真的校正好
 13. 氣壓高度輸出 開啟/關閉                → 寫入 IMU 設定
  0. 離開
 =========================================="""
@@ -168,7 +178,8 @@ CHECK_INTRO = [
 CHECK_FAIL_HINTS = [
     '不合格時:',
     '  - 加速度計:在水平桌面重做選項 2。',
-    '  - 陀螺儀靜止:通電 5 分鐘後,靜止重做選項 9。',
+    '  - 陀螺儀靜止:通電 5 分鐘、靜止放著,讓模組的陀螺儀自動校正修正後再測'
+    '(官方預設開啟,選項 9 可看狀態)。',
     '  - 陀螺儀轉一圈:轉慢一點、確實對準參考線再測一次;仍不合格是陀螺儀刻度誤差,'
     '本模組沒有可校正刻度的指令。',
     '  - 磁力計:清空周圍 20 cm 的電器與鐵件,重做選項 3 或 4。',
@@ -181,55 +192,44 @@ class _VerifyQuit(Exception):
 
 # Shown before every magnetometer calibration that displays per-axis progress.
 MAG_PROGRESS_HELP = [
-    '下方會分別顯示 X、Y、Z 三軸的進度(依磁力計讀數涵蓋的範圍計算),並列出還缺哪一軸:',
-    '  X 不夠 → 繞 Y 或 Z 軸轉;Y 不夠 → 繞 X 或 Z 軸轉;Z 不夠 → 繞 X 或 Y 軸轉。',
-    '三軸都到 100% 會顯示 [完成],再按 Enter 結束;多轉幾圈也沒關係。',
-    '進度只提示涵蓋範圍,不保證品質;校正後請用選項 12 檢測。',
+    '下方顯示每個平面的進度(和官方軟體的 XY、XZ、YZ 三張圖一樣:畫出一圈才算):',
+    '  XY 不夠 → 繞 Z 軸轉;XZ 不夠 → 繞 Y 軸轉;YZ 不夠 → 繞 X 軸轉。',
+    '進度只表示轉得夠不夠,不保證品質;全部校正完,用選項 12 驗證。',
 ]
 
 # Placement / precaution notes shown after a calibration item is chosen,
 # before anything is sent to the IMU.  Keys are menu choices.
 NOTES: Dict[str, List[str]] = {
     '2': [
-        '- 放在「真正水平」的桌面上,最好用水平儀確認;高度沒有影響,水平最重要。',
-        '- IMU Z 軸朝上,校正期間完全靜止、不要碰桌子。',
-        '- 可以先單獨校正 IMU 模組,再裝到機器人上。',
+        '- 官方:模組水平靜止放置,約 2 秒後三軸加速度應約為 0、0、1 g,X、Y 角度約 0°。',
+        '- 放在真正水平的桌面上,最好用水平儀確認;校正期間不要碰桌子。',
     ],
     '3': [
-        '- 在最終安裝位置、實際使用的環境做:IMU 要連同機器人一起轉,',
-        '  機器人身上會一起移動的鐵件才會被補償。',
-        '- 遠離環境中的鐵件與磁鐵 20 cm 以上(鐵桌、鐵櫃、含鋼筋地板、馬達、喇叭)。',
-        '- 如果 IMU 實際會貼近地板或桌面運作,就在同樣的距離下校正,不要換地方校正再搬回去。',
-        '- 機器人太大、無法三軸翻轉時,改用 4 雙平面校正。',
+        '- 官方:離電腦 50 cm 以上,拿在空中轉;不要直接在桌面上轉(桌下常有鐵樑)。',
+        '- 官方:常見干擾有電腦喇叭、桌下的鐵架、地板裡的鋼筋網。',
+        '- IMU 已裝在車上時,連車一起轉,車上的鐵件才會一起被補償。',
     ],
     '4': [
-        '- 在最終安裝位置、實際使用的環境做,適合無法三軸翻轉的機器人。',
-        '- 遠離環境中的鐵件與磁鐵 20 cm 以上(鐵桌、鐵櫃、含鋼筋地板、馬達、喇叭)。',
-        '- 如果 IMU 實際會貼近地板或桌面運作,就在同樣的距離下校正。',
+        '- 官方:離電腦 50 cm 以上,拿在空中轉;不要直接在桌面上轉(桌下常有鐵樑)。',
+        '- 適合車子太大、無法每個方向都翻轉時:只需要水平轉一圈、垂直轉一圈。',
     ],
     '5': [
-        '- 在最終位置做,先把機器人擺成你要當作「正前方」的方向。',
-        '- 需要時可以每次使用前重做。',
+        '- 官方:Z 軸歸零只在六軸演算法有效;九軸的 Z 軸是絕對角度(以磁北為準),不能歸零。',
+        '- 官方:模組靜止放置後執行;六軸模式下,模組每次上電 Z 軸也會自動歸零。',
     ],
     '6': [
-        '- IMU 裝到機器人上之後,把機器人放在水平地面再執行。',
-        '- 執行後,目前的姿態會被當作 roll = pitch = 0,用來修正 IMU 裝歪。',
+        '- 官方:把目前的姿態設為水平面。',
+        '- 官方警告:角度參考和加速度計校正同時使用,可能造成加速度、角度異常。',
     ],
     '7': [
-        '- 在你要當作 0 m 的高度執行,例如地面或出發點。',
-        '- 氣壓會隨天氣變化,每次使用前最好重做。',
-        '- CMP10A 出廠預設不輸出氣壓封包 (0x56):請先用選項 13 開啟,',
-        '  /imu/pressure 與 12 姿態檢視才看得到高度。',
-    ],
-    '9': [
-        '- IMU 通電暖機約 5 分鐘後再做:陀螺儀偏移會隨溫度改變。',
-        '- 水平靜止、Z 軸朝上;這項假設靜置時 accel = (0, 0, +g),IMU 裝歪時不要用。',
-        '- 建議先做 2 加速度計硬體校正,這項用來修剩下的誤差。',
+        '- 官方:以目前氣壓作為 0 m 高度;在你要當作 0 m 的位置執行。',
+        '- CMP10A 出廠預設不輸出氣壓(0x56):請先用選項 13 開啟,',
+        '  才會有 /imu/pressure 與高度。',
     ],
     '10': [
-        '- 和 3 一樣,在最終安裝位置、實際使用環境做,遠離環境中的鐵件 20 cm 以上。',
-        '- 取樣期間 X、Y、Z 三軸都要各轉滿一圈,結果才準。',
-        '- 建議先做 3 或 4 磁力計硬體校正,這項用來修剩下的誤差。',
+        '- 官方:九軸的航向(Z 軸)由磁力計決定,不會漂移,但怕磁場干擾;',
+        '  六軸的航向由陀螺儀累加,不受磁場影響,但會慢慢漂移。',
+        '- 官方:切換到六軸後,要重做加速度計校正(2)與 Z 軸歸零(5)。',
     ],
 }
 
@@ -273,8 +273,8 @@ class CalibrationMenu:
             '6': self.hw_angle_ref,
             '7': self.hw_height_zero,
             '8': self.read_offsets,
-            '9': self.sw_static,
-            '10': self.sw_mag,
+            '9': self.gyro_autocal_status,
+            '10': self.switch_algorithm,
             '11': self.factory_reset,
             '12': self.attitude_view,
             '13': self.toggle_pressure_output,
@@ -356,10 +356,6 @@ class CalibrationMenu:
     def _reset_software_offsets(self, fields) -> bool:
         """Clear residual offsets before persisting a new hardware baseline."""
         self._invalidate_checks()
-        if 'accel_bias' in fields:
-            self._done.discard('9')
-        if 'mag_offset' in fields:
-            self._done.discard('10')
         if not fields or not os.path.exists(self.config_path):
             return True
         try:
@@ -373,7 +369,7 @@ class CalibrationMenu:
                       '不要載入舊值啟動 driver。')
             return False
         self._out(f'已將 {self.config_path} 的 {", ".join(fields)} 歸零,保留其他欄位。')
-        self._out('請重新做需要的軟體校正(9 / 10),再用選項 12 檢測。')
+        self._out('全部校正完後,用選項 12 驗證是否真的校正好。')
         return True
 
     def _status(self, text: str) -> None:
@@ -400,13 +396,18 @@ class CalibrationMenu:
         return '  '.join(f'{name} {progress_bar(p, AXIS_BAR_WIDTH)}'
                          for name, p in zip('XYZ', cov.axis_progress()))
 
-    def _coverage_line(self, cov: MagCoverage, elapsed: float) -> str:
-        if not cov.samples:
-            if elapsed < NO_DATA_HINT_AFTER:
-                return f'等待 IMU 磁力計資料... {elapsed:3.0f}秒'
-            return f'未收到磁力計資料 {elapsed:3.0f}秒,無法判定;Enter 結束,不儲存'
-        tail = '[完成] 按 Enter' if cov.complete() else '缺 ' + ' '.join(cov.missing_axes())
-        return f'{self._axis_bars(cov)}  {elapsed:3.0f}秒  {tail}'
+    @staticmethod
+    def _plane_line(stage_text: Optional[str], cov: PlaneCoverage, last: bool,
+                    elapsed: float) -> str:
+        bars = '  '.join(
+            f'{PLANE_LABEL.get(p, p)} {progress_bar(cov.progress(p), PLANE_BAR_WIDTH)}'
+            for p in cov.planes)
+        if cov.complete():
+            tail = '[完成] 按 Enter' if last else '這段完成'
+        else:
+            tail = '缺 ' + ' '.join(PLANE_LABEL.get(p, p) for p in cov.missing())
+        head = f'{stage_text}  ' if stage_text else ''
+        return f'{head}{bars}  {elapsed:3.0f}秒  {tail}'
 
     def _measure_field_radius(self) -> Optional[float]:
         """Median |B| (raw LSB) over a short normal-mode window, or None without data."""
@@ -418,17 +419,16 @@ class CalibrationMenu:
                     norms.append(n)
         return statistics.median(norms) if norms else None
 
-    def _wait_mag_coverage(self, field_radius: Optional[float],
-                           target: float = MAG_COVERAGE_TARGET) -> None:
+    def _wait_mag_planes(self, stages) -> None:
         """
-        Wait for Enter while a reader thread shows per-axis magnetometer coverage.
+        Wait for Enter while a reader thread shows the per-plane progress, stage by stage.
 
         Progress comes from the magnetometer because the CMP10A freezes its
-        gyro / accel / angle output in magnetometer-calibration mode.
-        KeyboardInterrupt / EOFError from the prompt propagate to the caller
-        after the reader thread has been stopped.
+        gyro / accel / angle output in magnetometer-calibration mode.  Each
+        stage collects fresh samples; the next stage starts when one is done.
         """
-        cov = MagCoverage(field_radius, target=target)
+        covs = [PlaneCoverage(planes) for _, planes in stages]
+        state = {'stage': 0}
         self._mag_covered = False
         self.ser.reset_input_buffer()
         stop = threading.Event()
@@ -442,10 +442,20 @@ class CalibrationMenu:
                 while True:     # read at least once, even if Enter comes immediately
                     for p in self._read_stream(parser):
                         if isinstance(p, wp.Mag):
-                            cov.add(p)
+                            covs[state['stage']].add(p)
+                    if covs[state['stage']].complete() and state['stage'] < len(covs) - 1:
+                        state['stage'] += 1
                     now = self._time()
                     if now >= next_status:
-                        self._status(self._coverage_line(cov, now - start))
+                        i = state['stage']
+                        if not covs[0].samples and now - start >= NO_DATA_HINT_AFTER:
+                            line = (f'未收到磁力計資料 {now - start:3.0f}秒,無法判定;'
+                                    'Enter 結束,不儲存')
+                        else:
+                            text = stages[i][0] if len(stages) > 1 else None
+                            line = self._plane_line(text, covs[i], i == len(covs) - 1,
+                                                    now - start)
+                        self._status(line)
                         next_status = now + STATUS_INTERVAL
                     if stop.wait(READER_YIELD):
                         break
@@ -463,14 +473,33 @@ class CalibrationMenu:
             self._end_status()
         if thread.is_alive():
             raise serial.SerialException('無法停止磁力計取樣,不儲存')
-        self._mag_covered = bool(cov.samples) and cov.complete() and not errors
+        self._mag_covered = all(c.complete() for c in covs) and not errors
         if errors:
             raise errors[0]
-        if not cov.samples:
+        if not covs[0].samples:
             raise serial.SerialException('未收到磁力計資料,不儲存')
-        if not cov.complete():
-            self._out(f'提醒:{"、".join(cov.missing_axes())} 軸尚未涵蓋完整,'
-                      '品質尚未驗證。')
+        if not self._mag_covered:
+            missing = [f'{text}({"、".join(c.missing())})'
+                       for (text, _), c in zip(stages, covs) if not c.complete()]
+            self._out(f'提醒:{";".join(missing)} 尚未轉完,品質尚未驗證。')
+
+    def _wait_level(self) -> bool:
+        """Official dual-plane rule: start only with the IMU level within 15 deg."""
+        while True:
+            accels = [(p.x, p.y, p.z) for p in self._packets_for(READBACK_TIME)
+                      if isinstance(p, wp.Accel)]
+            if not accels:
+                self._out('未收到加速度資料,無法確認是否水平;已取消,未送出任何指令。')
+                return False
+            tilt = cc.tilt_deg(tuple(sum(a[i] for a in accels) / len(accels) for i in range(3)))
+            if tilt <= LEVEL_MAX_TILT_DEG:
+                self._out(f'IMU 目前水平(傾斜 {tilt:.1f}°),可以開始。')
+                return True
+            answer = self._ask(f'IMU 傾斜 {tilt:.1f}°,官方規定不可超過 {LEVEL_MAX_TILT_DEG:.0f}°。'
+                               '擺正後按 Enter 重新檢查,q 取消:').lower()
+            if answer == 'q':
+                self._out('已取消,未送出任何指令。')
+                return False
 
     def _hardware(self, mode: wp.CalMode, title: str, instructions: List[str],
                   wait_s: float = 0.0, mag_progress: bool = False) -> None:
@@ -495,6 +524,8 @@ class CalibrationMenu:
             if field_radius is None:
                 self._out('未收到有效磁力計資料,已取消,未送出校正或儲存指令。')
                 return
+        if mode == wp.CalMode.MAG_DUAL_PLANE and not self._wait_level():
+            return
         self._unlock()
         self._invalidate_checks()
         choices = {wp.CalMode.ACCEL: ('2',), wp.CalMode.MAG_SPHERE: ('3', '4'),
@@ -504,7 +535,7 @@ class CalibrationMenu:
         try:
             self._send(wp.cmd_calsw(mode))
             if mag_progress:
-                self._wait_mag_coverage(field_radius, mag_coverage_target(mode))
+                self._wait_mag_planes(MAG_STAGES[mode])
             elif wait_s > 0:
                 self._countdown(wait_s, '校正中,請保持不動')
         except (KeyboardInterrupt, EOFError):
@@ -529,7 +560,7 @@ class CalibrationMenu:
         except (serial.SerialException, OSError):
             self._out('儲存指令失敗,硬體狀態未知;舊軟體偏移已停用,請重新上電後用 12 檢測。')
             raise
-        self._out('已送出儲存指令;校正品質請用選項 12 檢測。')
+        self._out('已送出儲存指令。全部校正完後,用選項 12 驗證是否真的校正好。')
         if mag_progress and not self._mag_covered:
             return
         self._step_ok = True
@@ -556,10 +587,30 @@ class CalibrationMenu:
             self._out(f'\n返回選單(checksum 錯誤 {parser.checksum_errors} 次)')
 
     def hw_accel(self) -> None:
-        """Hardware accelerometer level calibration."""
+        """Hardware accelerometer level calibration (official: still for 2 s, then check)."""
         self._hardware(wp.CalMode.ACCEL, '加速度計水平校正',
-                       ['請將 IMU 水平靜置於桌面,校正期間不要觸碰。'],
+                       ['官方步驟:模組水平靜止放置,點一下校正,約 2 秒後完成。'],
                        wait_s=ACCEL_CAL_WAIT)
+        if self._step_ok:
+            self._show_accel_readback()
+
+    def _show_accel_readback(self) -> None:
+        """Show the readings the manual says to expect: about 0, 0, 1 g and 0 deg."""
+        accels, angles = [], []
+        for p in self._packets_for(READBACK_TIME):
+            if isinstance(p, wp.Accel):
+                accels.append((p.x, p.y, p.z))
+            elif isinstance(p, wp.Angle):
+                angles.append((math.degrees(p.roll), math.degrees(p.pitch)))
+        if not accels or not angles:
+            self._out('未收到資料,無法顯示校正後讀數;請用選項 1 確認。')
+            return
+        g = [sum(a[i] for a in accels) / len(accels) / wp.GRAVITY for i in range(3)]
+        roll = sum(a[0] for a in angles) / len(angles)
+        pitch = sum(a[1] for a in angles) / len(angles)
+        self._out(f'校正後讀數:加速度 X {g[0]:+.3f}  Y {g[1]:+.3f}  Z {g[2]:+.3f} g,'
+                  f'roll {roll:+.2f}°  pitch {pitch:+.2f}°')
+        self._out('官方:應約為 0、0、1 g,角度約 0°。')
 
     def hw_mag(self, mode: wp.CalMode, title: str) -> None:
         """Hardware magnetometer calibration (sphere fit or dual plane)."""
@@ -571,17 +622,36 @@ class CalibrationMenu:
         if mode == wp.CalMode.MAG_DUAL_PLANE:
             steps = list(DUAL_PLANE_STEPS)
         else:
-            steps = ['開始後請將 IMU 繞三軸緩慢轉動(X、Y、Z 各轉數圈),遠離金屬與磁鐵。']
+            steps = list(SPHERE_STEPS)
         steps += MAG_PROGRESS_HELP
         self._hardware(mode, title, steps, mag_progress=True)
 
+    def _read_axis6(self) -> Optional[int]:
+        regs = self._read_registers(REG_AXIS6)
+        return None if regs is None else regs.values[0] & 1
+
     def hw_heading_zero(self) -> None:
-        """Hardware Z-axis heading reset."""
-        self._hardware(wp.CalMode.HEADING_ZERO, 'Z 軸航向歸零',
-                       ['將以目前方向作為 yaw = 0。'], wait_s=SHORT_CAL_WAIT)
+        """Hardware Z-axis zero; official: only valid with the six-axis algorithm."""
+        axis6 = self._read_axis6()
+        if axis6 == 0:
+            self._out('目前是九軸演算法。官方:九軸的 Z 軸是絕對角度(以磁北為準),不能歸零。')
+            self._out('要歸零,先用選項 10 切換到六軸。未送出任何指令。')
+            return
+        if axis6 is None:
+            self._out('讀不到演算法設定。官方:Z 軸歸零只在六軸演算法有效。')
+            if not self._confirm('仍要執行嗎?'):
+                self._out('已取消,未送出任何指令。')
+                return
+        self._hardware(wp.CalMode.HEADING_ZERO, 'Z 軸角度歸零',
+                       ['官方步驟:模組靜止放置,以目前方向作為 Z 軸 0°。'],
+                       wait_s=SHORT_CAL_WAIT)
 
     def hw_angle_ref(self) -> None:
-        """Hardware angle reference."""
+        """Hardware angle reference (official warning: conflicts with accel calibration)."""
+        if not self._confirm('官方警告:角度參考和加速度計校正同時使用,可能造成加速度、'
+                             '角度異常。仍要執行嗎?'):
+            self._out('已取消,未送出任何指令。')
+            return
         self._hardware(wp.CalMode.ANGLE_REF, '設定角度參考',
                        ['請先將 IMU 擺在要作為參考 (roll = pitch = 0) 的姿態。'],
                        wait_s=SHORT_CAL_WAIT)
@@ -617,122 +687,49 @@ class CalibrationMenu:
         for addr, name in OFFSET_REGISTERS:
             self._out(f'  {name} (0x{addr:02X}) = {values[addr]:6d}')
 
-    def sw_static(self) -> None:
-        """Software gyro/accel static bias calibration written to YAML."""
-        cal = self._load_for_update()
-        if cal is None:
-            return
-        self._out('== 軟體靜態偏移校正 ==')
-        self._out('請將 IMU 水平靜置(Z 軸朝上),取樣期間不要觸碰。')
-        self._ask('準備好後按 Enter 開始...')
-        self._done.discard('9')
-        accels: List[wp.Accel] = []
-        gyros: List[wp.Gyro] = []
-        self._out(f'取樣中(各 {STATIC_SAMPLES} 筆),請保持不動...')
-        shown = -1
-        for p in self._packets_for(STATIC_TIMEOUT):
-            if isinstance(p, wp.Accel) and len(accels) < STATIC_SAMPLES:
-                accels.append(p)
-            elif isinstance(p, wp.Gyro) and len(gyros) < STATIC_SAMPLES:
-                gyros.append(p)
-            done = min(len(accels), len(gyros))
-            if done != shown:
-                self._status(f'取樣 {progress_bar(done / STATIC_SAMPLES)}  '
-                             f'{done}/{STATIC_SAMPLES} 筆')
-                shown = done
-            if done >= STATIC_SAMPLES:
-                break
-        self._end_status()
-        if min(len(accels), len(gyros)) < STATIC_SAMPLES:
-            self._out(f'校正失敗:樣本不足 {STATIC_SAMPLES} 筆,未寫入;請確認連線與鮑率。')
-            return
-        try:
-            gyro_bias, accel_bias = compute_static_bias(accels, gyros)
-        except ValueError as exc:
-            logger.error('static calibration failed: %s', exc)
-            self._out(f'校正失敗:{exc}(請確認序列埠與鮑率)')
-            return
-        if any(not self._still(g) for g in gyros):
-            self._out('校正失敗:取樣時偵測到旋轉,未寫入;請保持完全靜止後重做。')
-            return
-        mean_accel = (accel_bias[0], accel_bias[1], accel_bias[2] + wp.GRAVITY)
-        if any(math.dist((a.x, a.y, a.z), mean_accel) > MOVE_ACCEL for a in accels):
-            self._out('校正失敗:取樣時加速度不穩,未寫入;請勿碰觸或移動 IMU。')
-            return
-        if math.sqrt(sum(b * b for b in accel_bias)) > LARGE_ACCEL_BIAS:
-            self._out('校正失敗:加速度偏移量偏大,未寫入;請確認水平、Z 軸朝上後重做。')
-            return
-        cal = dataclasses.replace(cal,
-                                  gyro_bias=gyro_bias, accel_bias=accel_bias)
-        self._save(cal)
-        self._step_ok = True
+    def gyro_autocal_status(self) -> None:
+        """Show the gyro auto-calibration registers and the official explanation (read-only)."""
+        self._out('== 陀螺儀自動校正(唯讀)==')
+        regs = self._read_registers(REG_GYROCALITHR)
+        if regs is None:
+            self._out('讀取暫存器 0x61 逾時,未收到回覆;請確認連線與鮑率。')
+        else:
+            thr = regs.values[0] & 0xFFFF
+            hold = regs.values[2] & 0xFFFF
+            self._out(f'  靜止門檻 GYROCALITHR (0x61) = {thr / 1000:.3f}°/s')
+            self._out(f'  判定時間 GYROCALTIME (0x63) = {hold} ms')
+        self._out('官方說明(手冊 3.3.7):')
+        self._out('  - 陀螺儀預設會自動校正:角速度變化小於門檻時當作靜止,輸出 0。')
+        self._out('  - 因此「等速旋轉」也可能被當成靜止而輸出 0,這種用途官方建議關閉。')
+        self._out('  - 一般使用不需要關閉。')
+        self._out('這顆模組的開關指令尚未確認(不同型號的同一個暫存器意義不同),')
+        self._out('本工具不提供開關;需要時請用官方 Windows 軟體。')
 
-    def sw_mag(self) -> None:
-        """Software magnetometer hard-iron calibration written to YAML."""
-        cal = self._load_for_update()
-        if cal is None:
+    def switch_algorithm(self) -> None:
+        """Switch between the six-axis and nine-axis algorithm (AXIS6, 0x24)."""
+        self._out('== 演算法 六軸 / 九軸 ==')
+        axis6 = self._read_axis6()
+        if axis6 is None:
+            self._out('讀取演算法設定 (0x24) 逾時,未做任何變更;請確認連線與鮑率。')
             return
-        if not self._mag_precheck(notes_choice='10'):
+        names = {0: '九軸', 1: '六軸'}
+        new = 1 - axis6
+        self._out(f'目前:{names[axis6]}')
+        if not self._confirm(f'要切換成{names[new]}嗎?(會寫入 IMU flash)'):
+            self._out('已取消,未變更設定。')
             return
-        self._out('== 軟體磁力計 hard-iron 校正 ==')
-        self._out('按 Enter 後開始取樣,期間請將 IMU 繞三軸緩慢轉動(遠離金屬與磁鐵)。')
-        for line in MAG_PROGRESS_HELP[:2]:
-            self._out(line)
-        self._out('還需讓各面朝上、朝下;姿態涵蓋與磁場範圍都足夠才儲存。')
-        self._out(f'三軸都到 100% 會自動結束(最長 {SOFT_MAG_TIMEOUT:.0f} 秒)。')
-        self._ask('準備好後按 Enter 開始...')
-        self._done.discard('10')
-        # A raw |B| includes the offset we are trying to find. Use relative
-        # magnetic spans, gated by an independent gravity-direction sweep.
-        cov = MagCoverage(target=SOFT_MAG_COVERAGE_TARGET)
-        attitude_cov = MagCoverage(wp.GRAVITY, target=MAG_COVERAGE_TARGET)
-        mags: List[wp.Mag] = []
-        start = self._time()
-        next_status = start
-        for p in self._packets_for(SOFT_MAG_TIMEOUT):
-            now = self._time()
-            if isinstance(p, wp.Mag):
-                mags.append(p)
-                cov.add(p)
-            elif isinstance(p, wp.Accel):
-                a = cal.apply_accel(p)
-                norm = math.sqrt(a.x ** 2 + a.y ** 2 + a.z ** 2)
-                if abs(norm - wp.GRAVITY) < DIP_ACCEL_TOL:
-                    attitude_cov.add(wp.Accel(a.x * wp.GRAVITY / norm,
-                                              a.y * wp.GRAVITY / norm,
-                                              a.z * wp.GRAVITY / norm, a.temperature))
-            covered = cov.complete() and attitude_cov.complete()
-            done = covered and len(mags) >= MIN_SAMPLES
-            if done or now >= next_status:
-                tail = '[完成]' if done else '缺 ' + ' '.join(cov.missing_axes())
-                if not attitude_cov.complete():
-                    tail += '  姿態缺 ' + ' '.join(attitude_cov.missing_axes())
-                self._status(f'{self._axis_bars(cov)}  {now - start:3.0f}秒  '
-                             f'{len(mags)}筆  {tail}')
-                next_status = now + STATUS_INTERVAL
-            if done:
-                break
-        self._end_status()
-        if mags and not (cov.complete() and attitude_cov.complete()):
-            self._out(f'校正失敗:磁場缺 {"、".join(cov.missing_axes()) or "無"};'
-                      f'姿態缺 {"、".join(attitude_cov.missing_axes()) or "無"},涵蓋不足,'
-                      '未寫入,保留原校正檔;請重做。')
-            return
-        try:
-            offset = compute_mag_offset(mags)
-        except ValueError as exc:
-            logger.error('mag calibration failed: %s', exc)
-            self._out(f'校正失敗:{exc}(請確認序列埠與鮑率)')
-            return
-        corrected = [(m.x - offset[0], m.y - offset[1], m.z - offset[2]) for m in mags]
-        spread = cc.magnitude_spread(corrected)
-        if not cc.magnitude_ok(spread):
-            self._out(f'校正失敗:扣除偏移後場強不一致(變動 ±{spread:.1%}),未寫入。')
-            self._out('請移開磁場干擾、完整轉動,必要時先重做硬體磁力計校正(3 / 4)。')
-            return
-        cal = dataclasses.replace(cal, mag_offset=offset)
-        self._save(cal)
-        self._step_ok = True
+        self._unlock()
+        self._send(wp.cmd_write(REG_AXIS6, new))
+        self._ensure_unlocked()
+        self._send(wp.cmd_save())
+        self._invalidate_checks()
+        if self._read_axis6() == new:
+            self._out(f'已切換為{names[new]}並送出儲存指令。')
+            self._step_ok = True
+        else:
+            self._out('已送出切換與儲存指令,但讀回的設定不符,狀態未知;請重新上電後再看一次。')
+        self._out('官方:切換後要重做加速度計校正(2)' +
+                  (',並做 Z 軸歸零(5)。' if new == 1 else '與磁力計校正(3 或 4)。'))
 
     def attitude_view(self) -> None:
         """Run the calibration check, or open the free attitude view."""
@@ -1724,13 +1721,6 @@ def render_menu(done=(), color: bool = False) -> str:
                 line = f'{ANSI_COLOURS[PASS]}{line}{ANSI_RESET}'
         lines.append(line)
     return '\n'.join(lines)
-
-
-def mag_coverage_target(mode: wp.CalMode) -> float:
-    """Return the per-axis swing fraction that counts as done for ``mode``."""
-    if mode == wp.CalMode.MAG_DUAL_PLANE:
-        return DUAL_PLANE_COVERAGE_TARGET
-    return MAG_COVERAGE_TARGET
 
 
 def progress_bar(fraction: float, width: int = PROGRESS_WIDTH) -> str:

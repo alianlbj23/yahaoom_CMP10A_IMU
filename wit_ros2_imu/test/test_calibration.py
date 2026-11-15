@@ -14,6 +14,7 @@
 
 """Unit tests for the software calibration model."""
 
+import math
 import pathlib
 import struct
 
@@ -324,3 +325,54 @@ def test_mag_coverage_on_real_mag_calibration_recording_completes():
     for x, y, z, _ in frames[0x54]:
         cov.add(_mag(x, y, z))
     assert cov.complete(), cov.axis_progress()
+
+
+# ---------------------------------------------- per-plane magnetometer coverage
+
+def _circle(plane, radius=4000.0, centre=(300.0, -200.0, 100.0), degrees=360, step=10,
+            other=0.0):
+    """Points on a circle in one plane ('XY', 'XZ' or 'YZ') around ``centre``."""
+    i, j = 'XYZ'.index(plane[0]), 'XYZ'.index(plane[1])
+    pts = []
+    for d in range(0, degrees, step):
+        v = [other, other, other]
+        v[i] = radius * math.cos(math.radians(d))
+        v[j] = radius * math.sin(math.radians(d))
+        pts.append(Mag(*(c + o for c, o in zip(v, centre)), 25.0))
+    return pts
+
+
+def test_plane_coverage_needs_a_full_circle_in_each_plane():
+    cov = cal.PlaneCoverage(('XY', 'XZ', 'YZ'))
+    for m in _circle('XY') + _circle('XZ'):
+        cov.add(m)
+    assert cov.progress('XY') == 1.0 and cov.progress('XZ') == 1.0
+    assert cov.progress('YZ') < 1.0
+    assert cov.missing() == ['YZ']
+    assert not cov.complete()
+    for m in _circle('YZ'):
+        cov.add(m)
+    assert cov.complete()
+
+
+def test_plane_coverage_half_a_turn_is_not_enough():
+    cov = cal.PlaneCoverage(('XY',))
+    for m in _circle('XY', degrees=180):
+        cov.add(m)
+    assert 0.4 < cov.progress('XY') < 1.0
+    assert not cov.complete()
+
+
+def test_plane_coverage_either_vertical_plane_counts_for_dual_plane():
+    cov = cal.PlaneCoverage(('XZ|YZ',))
+    for m in _circle('YZ'):
+        cov.add(m)
+    assert cov.complete()
+
+
+def test_plane_coverage_ignores_points_near_the_centre():
+    """Turning in one plane must not fill another plane through noise."""
+    cov = cal.PlaneCoverage(('XY', 'XZ'))
+    for m in _circle('XY'):
+        cov.add(m)
+    assert cov.progress('XZ') < 0.5
