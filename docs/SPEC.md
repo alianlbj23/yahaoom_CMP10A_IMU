@@ -99,6 +99,11 @@ mag_offset: [x, y, z]    # raw LSB
 9. 軟體靜態偏移校正(gyro/accel → YAML) 10. 軟體磁力計 hard-iron 校正(→ YAML) 11. 恢復原廠設定 12. 校正檢測 / 姿態檢視(唯讀;Enter 為以外部參考判定的五項檢測,規格見 docs/CALIBRATION_CHECK.md;f 為可設參考點看 Δ 的姿態檢視) 13. 氣壓高度輸出 開啟/關閉(RSW bit 6) 0. 離開
 - 任何寫入 flash 前都要求使用者確認 (y/N)
 - 硬體指令流程:unlock → CALSW → (等待/使用者操作) → CALSW NORMAL → save
+- 磁力計硬校無有效資料不開始;過程無資料、讀取失敗或中斷時嘗試 NORMAL 且不 SAVE。部分涵蓋須額外確認(預設否),不標完成;SAVE 前重檢解鎖。
+- 硬體 SAVE 或原廠重設前,先原子地將對應 YAML 殘差寫為零向量並保留其他欄位:加速度校正清 accel_bias、磁校清 mag_offset、原廠重設清全部。事前說明且拒絕操作損壞的 YAML;寫檔失敗不送 SAVE 或重設指令,要求重新上電。
+- 軟體靜態校正須收滿50筆並檢查明顯旋轉、加速度變動與水平;磁校須同時達到磁場相對跨度與獨立重力方向涵蓋。取樣不合格或 YAML 損壞均不覆寫。
+- 軟體磁校扣除擬合中心後,場強須通過 calibration_check 既有的 magnitude_ok 門檻,否則拒存。仍須用選項12與新資料驗證。
+- 校正改變後舊檢測結果失效;重測先撤銷受測項目舊結果。涵蓋進度是提示,軟體偏移不會改模組輸出的 orientation。
 - 序列埠開啟設 timeout;錯誤訊息清楚並以非 0 結束
 
 ### `wit_ros2_imu.py`(ROS 2 node,executable `wit_ros2_imu`)

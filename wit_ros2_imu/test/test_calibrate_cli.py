@@ -202,8 +202,8 @@ def test_accel_calibration_sequence_and_wait(clock, tmp_path):
     ('4', wp.CalMode.MAG_DUAL_PLANE),
 ])
 def test_mag_calibration_waits_for_enter(clock, tmp_path, choice, mode):
-    ser = FakeSerial(clock)
-    rc, out, inp = run(ser, [choice, 'y', '', '0'], clock, tmp_path)
+    ser = FakeSerial(clock, stream=_sphere_stream())
+    rc, out, inp = run(ser, [choice, 'y', '', 'y', '0'], clock, tmp_path)
     assert rc == 0
     assert ser.writes == [UNLOCK, wp.cmd_calsw(mode), NORMAL, SAVE]
     assert '三軸' in out.text
@@ -212,11 +212,11 @@ def test_mag_calibration_waits_for_enter(clock, tmp_path, choice, mode):
 
 def test_mag_calibration_long_rotation_reunlocks_before_normal(clock, tmp_path):
     # Unlock only lasts ~10 s; after a 60 s rotation the CLI re-unlocks first.
-    ser = FakeSerial(clock)
-    rc, _, _ = run(ser, ['3', 'y', '', '0'], clock, tmp_path, advance=60.0)
+    ser = FakeSerial(clock, stream=_sphere_stream())
+    rc, _, _ = run(ser, ['3', 'y', '', 'y', '0'], clock, tmp_path, advance=60.0)
     assert rc == 0
     assert ser.writes == [UNLOCK, wp.cmd_calsw(wp.CalMode.MAG_SPHERE),
-                          UNLOCK, NORMAL, SAVE]
+                          UNLOCK, NORMAL, UNLOCK, SAVE]
 
 
 @pytest.mark.parametrize('choice,mode', [
@@ -240,7 +240,7 @@ def test_hardware_write_failure_is_reported(clock, tmp_path):
 
 
 def test_ctrl_c_during_mag_calibration_restores_normal_without_save(clock, tmp_path):
-    ser = FakeSerial(clock)
+    ser = FakeSerial(clock, stream=_sphere_stream())
     out = Output()
     answers = iter(['3', 'y'])
 
@@ -352,31 +352,68 @@ def test_software_static_calibration_no_data(clock, tmp_path):
 def test_software_static_calibration_corrupt_existing_yaml(clock, tmp_path):
     path = tmp_path / 'imu_calibration.yaml'
     path.write_text('gyro_bias: [oops\n')
+    before = path.read_bytes()
     ser = FakeSerial(clock, stream=_static_stream())
     rc, out, _ = run(ser, ['9', '', '0'], clock, tmp_path)
     assert rc == 0
     assert '格式錯誤' in out.text
-    data = yaml.safe_load(path.read_text())
-    assert data['mag_offset'] == [0.0, 0.0, 0.0]
+    assert path.read_bytes() == before
 
 
-def _mag_stream():
+@pytest.mark.parametrize('problem', ['tilt', 'turn', 'shake', 'too_few'])
+def test_invalid_static_samples_preserve_existing_yaml(clock, tmp_path, problem, monkeypatch):
+    """Rejected sampling must not overwrite the previous working calibration."""
+    streams = {
+        'tilt': _acc_frame(3, 0, 9.3) + _gyro_frame(0, 0, 0),
+        'turn': _acc_frame(0, 0, wp.GRAVITY) + _gyro_frame(0, 0, 15),
+        'shake': (_acc_frame(1, 0, wp.GRAVITY) + _acc_frame(-1, 0, wp.GRAVITY)
+                  + _gyro_frame(0, 0, 0)),
+        'too_few': _static_stream(),
+    }
+    if problem == 'too_few':
+        monkeypatch.setattr(cli, 'STATIC_TIMEOUT', 1.0)
+    path = tmp_path / 'imu_calibration.yaml'
+    cal.save_calibration(path, cal.SoftwareCalibration(gyro_bias=(0.01, 0.02, 0.03)))
+    before = path.read_bytes()
+    ser = FakeSerial(clock, stream=streams[problem])
+    rc, out, _ = run(ser, ['9', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert path.read_bytes() == before
+    assert '未寫入' in out.text
+    assert cli.DONE_MARK not in _menu_row(_menu_blocks(out)[-1], 9)
+
+
+def _normal_mag_stream(radius=1000, center=(60, -40, 20), moving=True, accel_scale=1.0):
+    """Normal-mode orientations at field and gravity extrema, with a fixed dip."""
     frames = b''
-    for i in range(12):
-        x = -100 + 20 * i
-        frames += make_frame(0x54, i16(x + 50, -x - 30, 2 * x, 2500))
+    sine, cosine = math.sin(math.radians(36)), math.cos(math.radians(36))
+    for axis in range(3):
+        other = (axis + 1) % 3
+        for sign in (-1, 1):
+            for side in (-1, 1):
+                for field_extreme in (True, False):
+                    a, m = [0.0] * 3, [0.0] * 3
+                    if field_extreme:
+                        m[axis] = sign * radius
+                        a[axis], a[other] = -sign * wp.GRAVITY * sine, side * wp.GRAVITY * cosine
+                    else:
+                        a[axis] = sign * wp.GRAVITY
+                        m[axis], m[other] = -sign * radius * sine, side * radius * cosine
+                    if not moving:
+                        a = [0, 0, wp.GRAVITY]
+                    frames += (_acc_frame(*(v * accel_scale for v in a)) + _gyro_frame(0, 0, 0)
+                               + _mag_frame(*(v + off for v, off in zip(m, center))))
     return frames
 
 
 def test_software_mag_calibration_writes_yaml(clock, tmp_path):
     path = tmp_path / 'imu_calibration.yaml'
     cal.save_calibration(path, cal.SoftwareCalibration(gyro_bias=(0.1, 0.2, 0.3)))
-    ser = FakeSerial(clock, stream=_mag_stream())
+    ser = FakeSerial(clock, stream=_normal_mag_stream())
     rc, out, _ = run(ser, ['10', '', '0'], clock, tmp_path)
     assert rc == 0
     assert ser.writes == []
     data = yaml.safe_load(path.read_text())
-    # x: [-50, 170] -> 60; y: [-150, 70] -> -40; z: [-200, 240] -> 20
     assert data['mag_offset'] == pytest.approx([60.0, -40.0, 20.0])
     assert data['gyro_bias'] == pytest.approx([0.1, 0.2, 0.3])   # preserved
     assert '轉動' in out.text
@@ -643,9 +680,9 @@ def _wait_for(out, text, timeout=5.0):
         _time.sleep(0.01)
 
 
-def _run_mag_waiting_for(ser, clock, tmp_path, choice, wait_text):
+def _run_mag_waiting_for(ser, clock, tmp_path, choice, wait_text, partial_answer='0'):
     out = Output()
-    answers = [choice, 'y', None, '0']        # None = press Enter after wait_text appears
+    answers = [choice, 'y', None, partial_answer, '0']
     calls = {'n': 0}
 
     def inp(prompt=''):
@@ -693,7 +730,8 @@ def test_mag_calibration_shows_each_axis_and_what_is_missing(clock, tmp_path):
     assert 'X [' in last and 'Y [' in last and 'Z [' in last
     assert 'X [########] 100%' in last
     assert '尚未' in out.text                                  # Enter pressed too early
-    assert ser.writes[-2:] == [NORMAL, SAVE]
+    assert ser.writes[-1:] == [NORMAL]
+    assert SAVE not in ser.writes
 
 
 def test_mag_calibration_explains_which_rotation_fixes_each_axis(clock, tmp_path):
@@ -710,12 +748,151 @@ def test_mag_status_line_fits_80_columns(clock, tmp_path):
     assert widths and max(widths) <= 79, max(widths)
 
 
-def test_mag_calibration_without_data_shows_elapsed_time_hint(clock, tmp_path):
-    ser = FakeSerial(clock)                                  # IMU sends nothing
-    rc, out = _run_mag_waiting_for(ser, clock, tmp_path, '3', '未收到')
+def test_mag_calibration_without_data_does_not_enter_calibration_or_save(clock, tmp_path):
+    ser = FakeSerial(clock)
+    rc, out, _ = run(ser, ['3', 'y', '0'], clock, tmp_path)
     assert rc == 0
-    assert '秒' in out.text
-    assert ser.writes[-2:] == [NORMAL, SAVE]
+    assert '未收到' in out.text
+    assert ser.writes == []
+
+
+def test_mag_read_failure_restores_normal_without_save(clock, tmp_path):
+    class BrokenDuringCalibration(FakeSerial):
+
+        def read(self, size=1):
+            if wp.cmd_calsw(wp.CalMode.MAG_SPHERE) in self.writes:
+                raise serial.SerialException('reader disconnected')
+            return super().read(size)
+
+    ser = BrokenDuringCalibration(clock, stream=_sphere_stream())
+    rc, out, _ = run(ser, ['3', 'y', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert ser.writes[-1] == NORMAL
+    assert SAVE not in ser.writes
+    assert 'reader disconnected' in out.text
+
+
+def test_mag_data_stops_after_start_restores_normal_without_save(clock, tmp_path):
+    class StopsDuringCalibration(FakeSerial):
+
+        def read(self, size=1):
+            if wp.cmd_calsw(wp.CalMode.MAG_SPHERE) in self.writes:
+                self.stream = b''
+                self._rx.clear()
+            return super().read(size)
+
+    ser = StopsDuringCalibration(clock, stream=_sphere_stream())
+    rc, out, _ = run(ser, ['3', 'y', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert ser.writes[-1] == NORMAL
+    assert SAVE not in ser.writes
+    assert '未收到' in out.text
+
+
+@pytest.mark.parametrize('choice,fields', [
+    ('2', ('accel_bias',)),
+    ('3', ('mag_offset',)),
+    ('4', ('mag_offset',)),
+    ('11', cal.FIELDS),
+])
+def test_hardware_change_clears_only_obsolete_software_offsets(clock, tmp_path, choice, fields):
+    """A new hardware baseline must not receive the previous residual correction."""
+    path = tmp_path / 'c.yaml'
+    previous = cal.SoftwareCalibration(gyro_bias=(0.01, 0.02, 0.03),
+                                       accel_bias=(0.1, 0.2, 0.3), mag_offset=(1, 2, 3))
+    cal.save_calibration(path, previous)
+
+    class CheckOrder(FakeSerial):
+
+        def write(self, data):
+            if data in (SAVE, wp.cmd_factory_reset()):
+                current = cal.load_calibration(path)
+                assert all(getattr(current, field) == (0, 0, 0) for field in fields)
+            return super().write(data)
+
+    ser = CheckOrder(clock, stream=_sphere_stream())
+    if choice in ('3', '4'):
+        _run_mag_waiting_for(ser, clock, tmp_path, choice, '[完成] 按 Enter')
+    else:
+        answers = [choice, 'y', 'y', '0'] if choice == '11' else [choice, 'y', '0']
+        cli.run_menu(ser, scripted(answers), Output(), path,
+                     sleep_fn=clock.sleep, time_fn=clock.time)
+    current = cal.load_calibration(path)
+    for field in cal.FIELDS:
+        expected = (0, 0, 0) if field in fields else getattr(previous, field)
+        assert getattr(current, field) == expected
+
+
+def test_hardware_calibration_does_not_overwrite_a_corrupt_yaml(clock, tmp_path):
+    path = tmp_path / 'imu_calibration.yaml'
+    path.write_text('accel_bias: [oops\n')
+    before = path.read_bytes()
+    ser = FakeSerial(clock)
+    rc, out, _ = run(ser, ['2', 'y', '0'], clock, tmp_path)
+    assert rc == 0
+    assert ser.writes == []
+    assert path.read_bytes() == before
+    assert '格式錯誤' in out.text
+
+
+def test_partial_mag_save_requires_confirmation_and_is_not_marked_done(clock, tmp_path):
+    ser = FakeSerial(clock, stream=_sphere_stream(axes=(0,)))
+    rc, out = _run_mag_waiting_for(ser, clock, tmp_path, '3', '缺 Y Z', partial_answer='y')
+    assert rc == 0
+    assert ser.writes[-1] == SAVE
+    assert cli.DONE_MARK not in _menu_row(_menu_blocks(out)[-1], 3)
+
+
+@pytest.mark.parametrize('choice', ['2', '11'])
+def test_offset_file_failure_prevents_persisting_hardware_change(
+        clock, tmp_path, monkeypatch, choice):
+    path = tmp_path / 'imu_calibration.yaml'
+    cal.save_calibration(path, cal.SoftwareCalibration(accel_bias=(0.1, 0.2, 0.3)))
+    before = path.read_bytes()
+
+    def cannot_save(*args):
+        raise PermissionError('read-only calibration directory')
+
+    monkeypatch.setattr(cli, 'save_calibration', cannot_save)
+    ser = FakeSerial(clock)
+    answers = [choice, 'y', 'y', '0'] if choice == '11' else [choice, 'y', '0']
+    rc, out, _ = run(ser, answers, clock, tmp_path)
+    assert rc == 0
+    assert SAVE not in ser.writes
+    assert wp.cmd_factory_reset() not in ser.writes
+    assert path.read_bytes() == before
+    assert '未送出儲存或重設指令' in out.text and '重新上電' in out.text
+    assert cli.DONE_MARK not in _menu_row(_menu_blocks(out)[-1], int(choice))
+
+
+@pytest.mark.parametrize('choice,fields,command', [
+    ('2', ('accel_bias',), SAVE),
+    ('11', cal.FIELDS, wp.cmd_factory_reset()),
+])
+def test_hardware_persist_failure_keeps_software_offsets_zero(
+        clock, tmp_path, choice, fields, command):
+    """Failure after clearing YAML may lose a residual, never restore a stale one."""
+    path = tmp_path / 'imu_calibration.yaml'
+    previous = cal.SoftwareCalibration(gyro_bias=(0.01, 0.02, 0.03),
+                                       accel_bias=(0.1, 0.2, 0.3), mag_offset=(1, 2, 3))
+    cal.save_calibration(path, previous)
+
+    class CannotPersist(FakeSerial):
+
+        def write(self, data):
+            if data == command:
+                raise serial.SerialException('persist failed')
+            return super().write(data)
+
+    ser = CannotPersist(clock)
+    answers = [choice, 'y', 'y', '0'] if choice == '11' else [choice, 'y', '0']
+    rc, out, _ = run(ser, answers, clock, tmp_path)
+    assert rc == 0
+    current = cal.load_calibration(path)
+    for field in cal.FIELDS:
+        expected = (0, 0, 0) if field in fields else getattr(previous, field)
+        assert getattr(current, field) == expected
+    assert 'persist failed' in out.text and '重新上電' in out.text
 
 
 def test_mag_calibration_serial_error_in_reader_is_reported(clock, tmp_path):
@@ -739,7 +916,7 @@ def test_software_static_calibration_shows_progress(clock, tmp_path):
 
 def test_software_mag_calibration_ends_when_every_axis_is_covered(clock, tmp_path):
     path = tmp_path / 'imu_calibration.yaml'
-    ser = FakeSerial(clock, stream=_sphere_stream(radius=1000, center=(60, -40, 20)))
+    ser = FakeSerial(clock, stream=_normal_mag_stream())
     rc, out, _ = run(ser, ['10', '', '0'], clock, tmp_path)
     assert rc == 0
     assert clock.now < cli.SOFT_MAG_TIMEOUT
@@ -748,13 +925,52 @@ def test_software_mag_calibration_ends_when_every_axis_is_covered(clock, tmp_pat
     assert '不足' not in out.text
 
 
+def test_software_mag_with_large_hard_iron_can_finish(clock, tmp_path):
+    """An offset larger than |B| must not make the progress unreachable."""
+    ser = FakeSerial(clock, stream=_normal_mag_stream(center=(6000, -4000, 2000)))
+    rc, out, _ = run(ser, ['10', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert clock.now < cli.SOFT_MAG_TIMEOUT
+    data = cal.load_calibration(tmp_path / 'imu_calibration.yaml')
+    assert data.mag_offset == pytest.approx((6000, -4000, 2000))
+    assert '[完成]' in out.text
+
+
+@pytest.mark.parametrize('moving,accel_scale', [(False, 1.0), (True, 2.0)])
+def test_software_mag_needs_independent_orientation_coverage(clock, tmp_path,
+                                                             moving, accel_scale):
+    """A changing magnetic field around a stationary IMU is not a full turn."""
+    path = tmp_path / 'imu_calibration.yaml'
+    cal.save_calibration(path, cal.SoftwareCalibration(mag_offset=(1, 2, 3)))
+    before = path.read_bytes()
+    ser = FakeSerial(clock, stream=_normal_mag_stream(moving=moving, accel_scale=accel_scale))
+    rc, out, _ = run(ser, ['10', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert path.read_bytes() == before
+    assert '姿態' in out.text and '不足' in out.text
+
+
 def test_software_mag_calibration_warns_with_missing_axes(clock, tmp_path):
     ser = FakeSerial(clock, stream=_sphere_stream(axes=(0, 1)))  # Z never covered
     rc, out, _ = run(ser, ['10', '', '0'], clock, tmp_path)
     assert rc == 0
     assert clock.now >= cli.SOFT_MAG_TIMEOUT
     assert '不足' in out.text and 'Z' in out.text
-    assert (tmp_path / 'imu_calibration.yaml').exists()
+    assert not (tmp_path / 'imu_calibration.yaml').exists()
+
+
+def test_software_mag_rejects_an_inconsistent_fitted_center(clock, tmp_path):
+    """Matching spans and gravity coverage cannot make a bad center safe to save."""
+    path = tmp_path / 'imu_calibration.yaml'
+    cal.save_calibration(path, cal.SoftwareCalibration(mag_offset=(1, 2, 3)))
+    before = path.read_bytes()
+    spikes = b''.join(_mag_frame(*(5000 if i == axis else 0 for i in range(3)))
+                      for axis in range(3))
+    ser = FakeSerial(clock, stream=spikes + _normal_mag_stream())
+    rc, out, _ = run(ser, ['10', '', '0'], clock, tmp_path)
+    assert rc == 0
+    assert path.read_bytes() == before
+    assert '場強不一致' in out.text
 
 
 def test_progress_bar_never_shows_100_percent_before_done():
@@ -977,10 +1193,12 @@ def test_dual_plane_instructions_explain_when_to_stop():
 
 def test_use_color_only_on_a_tty_without_no_color():
     class Tty:
+
         def isatty(self):
             return True
 
     class Pipe:
+
         def isatty(self):
             return False
 
@@ -1528,6 +1746,48 @@ def test_a_later_failure_removes_an_earlier_pass(clock, tmp_path, short_still):
     assert '[不合格] 4. 磁力計 合成大小' in last
     assert '全部合格' not in last
     last_menu = [ln for ln in run.lines if 'CMP10A IMU 校正工具' in ln][-1]
+    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
+
+
+def test_skipping_a_repeated_check_revokes_its_previous_pass(clock, tmp_path, short_still):
+    """A skipped retest must not silently reuse its old green result."""
+    steps = _good_steps() + [(None, '', 0), (STEADY, 's', 0.1), (None, 'q', 0)]
+    result = _Check(clock, tmp_path, steps, menu=['12', '', '12', '4'])
+    assert '5/5 項全部合格' in result.text
+    last = result.text.rsplit('== 檢測結果 ==', 1)[-1]
+    assert '5/5 項全部合格' not in last
+    last_menu = [line for line in result.lines if 'CMP10A IMU 校正工具' in line][-1]
+    assert cli.DONE_MARK not in _menu_row(last_menu, 12)
+
+
+@pytest.mark.parametrize('choice,stream,answers', [
+    ('2', b'', ['y']),
+    ('9', _static_stream(), ['']),
+    ('10', _normal_mag_stream(), ['']),
+])
+def test_calibration_changes_invalidate_previous_verification(clock, tmp_path,
+                                                              choice, stream, answers):
+    menu = cli.CalibrationMenu(FakeSerial(clock, stream=stream), scripted(answers), Output(),
+                               tmp_path / 'c.yaml', sleep_fn=clock.sleep, time_fn=clock.time)
+    menu._check_passed.update(cli.CHECK_ITEMS)
+    menu._done.add('12')
+    menu._actions[choice]()
+    assert not menu._check_passed
+    assert '12' not in menu._done
+
+
+def test_skipped_environment_step_is_not_reported_as_suitable(clock, tmp_path):
+    result = _Check(clock, tmp_path, [(STEADY, None, 0), (STEADY, 's', 0.1)],
+                    menu=['3', 'n', 'n'])
+    assert '環境與安裝位置合適' not in result.text
+    assert '檢查未完成' in result.text
+
+
+def test_interrupted_full_retest_cannot_reuse_unvisited_results(clock, tmp_path, short_still):
+    steps = _good_steps() + [(STEADY, 'q', 0.1)]
+    result = _Check(clock, tmp_path, steps, menu=['12', '', '12', ''])
+    assert '5/5 項全部合格' in result.text
+    last_menu = [line for line in result.lines if 'CMP10A IMU 校正工具' in line][-1]
     assert cli.DONE_MARK not in _menu_row(last_menu, 12)
 
 

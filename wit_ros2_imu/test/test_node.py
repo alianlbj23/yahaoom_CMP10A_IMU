@@ -29,7 +29,7 @@ from rclpy.parameter import Parameter
 from rclpy.time import Time
 from sensor_msgs.msg import Imu, MagneticField, Temperature
 import serial
-from wit_ros2_imu.calibration import SoftwareCalibration
+from wit_ros2_imu.calibration import save_calibration, SoftwareCalibration
 from wit_ros2_imu.wit_protocol import Accel, Angle, euler_to_quaternion, GRAVITY, Gyro, Quaternion
 from wit_ros2_imu.wit_ros2_imu import (
     build_imu_msg,
@@ -251,11 +251,16 @@ def test_reader_rejects_bad_interval():
 # WitImuNode (ROS)
 # --------------------------------------------------------------------------
 
-def test_node_publishes_imu_from_recorded_stream(ros_context, namespace):
+@pytest.mark.parametrize('use_zero_file', [False, True])
+def test_node_publishes_imu_from_recorded_stream(ros_context, namespace, tmp_path, use_zero_file):
+    calibration_file = ''
+    if use_zero_file:
+        calibration_file = str(tmp_path / 'imu_calibration.yaml')
+        save_calibration(calibration_file, SoftwareCalibration())
     server = FixtureServer(FIXTURE.read_bytes())
     node = WitImuNode(context=ros_context, namespace=namespace, parameter_overrides=[
         Parameter('port', value=f'socket://127.0.0.1:{server.port}'),
-        Parameter('calibration_file', value=''),
+        Parameter('calibration_file', value=calibration_file),
         Parameter('reconnect_interval', value=0.2),
     ])
     listener = rclpy.create_node('listener', context=ros_context, namespace=namespace)
