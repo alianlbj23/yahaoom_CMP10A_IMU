@@ -176,6 +176,7 @@ CHECK_INTRO = [
     '  重力 1 g、靜止時角速度為 0、桌上的參考線、NOAA 地磁模型的當地磁傾角。',
     '合格門檻與理由見 docs/CALIBRATION_CHECK.md。q = 結束檢測,s = 略過這一項。',
 ]
+BACK_TO_MENU = '按 Enter 返回選單:'   # results stay on screen until the user is done reading
 CHECK_FAIL_HINTS = [
     '不合格時:',
     '  - 加速度計:在水平桌面重做選項 2。',
@@ -744,6 +745,7 @@ class CalibrationMenu:
             return
         if cmd == '5':
             self._mag_precheck(report_only=True)
+            self._ask(BACK_TO_MENU)
             return
         if cmd == 'f':
             self._attitude_free_view()
@@ -1538,6 +1540,7 @@ class CalibrationMenu:
         self._step_ok = passed == len(CHECK_ITEMS)
         if not self._step_ok:
             self._done.discard('12')        # the latest check decides, not an earlier one
+        self._ask(BACK_TO_MENU)
 
     def _attitude_free_view(self) -> None:
         """Show live roll / pitch / yaw / height, optionally relative to a reference."""

@@ -1446,7 +1446,7 @@ def test_a_later_failure_removes_an_earlier_pass(clock, tmp_path, short_still):
     steps = _good_steps() + [(None, '', 0),
                              (_mag_check_stream(offset=(900.0, 0.0, 0.0)), None, 0),
                              (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, menu=['12', '', '12', '4'])
+    run = _Check(clock, tmp_path, steps, menu=['12', '', '', '12', '4'])   # '' = back to menu
     assert '5/5 項全部合格' in run.text                        # first run
     last = run.text.rsplit('== 檢測結果 ==', 1)[1]
     assert '[不合格] 4. 磁力計 合成大小' in last
@@ -1458,7 +1458,7 @@ def test_a_later_failure_removes_an_earlier_pass(clock, tmp_path, short_still):
 def test_skipping_a_repeated_check_revokes_its_previous_pass(clock, tmp_path, short_still):
     """A skipped retest must not silently reuse its old green result."""
     steps = _good_steps() + [(None, '', 0), (STEADY, 's', 0.1), (None, 'q', 0)]
-    result = _Check(clock, tmp_path, steps, menu=['12', '', '12', '4'])
+    result = _Check(clock, tmp_path, steps, menu=['12', '', '', '12', '4'])
     assert '5/5 項全部合格' in result.text
     last = result.text.rsplit('== 檢測結果 ==', 1)[-1]
     assert '5/5 項全部合格' not in last
@@ -1489,7 +1489,7 @@ def test_skipped_environment_step_is_not_reported_as_suitable(clock, tmp_path):
 
 def test_interrupted_full_retest_cannot_reuse_unvisited_results(clock, tmp_path, short_still):
     steps = _good_steps() + [(STEADY, 'q', 0.1)]
-    result = _Check(clock, tmp_path, steps, menu=['12', '', '12', ''])
+    result = _Check(clock, tmp_path, steps, menu=['12', '', '', '12', ''])
     assert '5/5 項全部合格' in result.text
     last_menu = [line for line in result.lines if 'CMP10A IMU 校正工具' in line][-1]
     assert cli.DONE_MARK not in _menu_row(last_menu, 12)
@@ -1521,7 +1521,7 @@ def test_check_gyro_still_ignores_enter_while_measuring(clock, tmp_path, short_s
 def test_inclination_is_asked_every_time_with_the_last_value_offered(clock, tmp_path):
     steps = [(None, '30', 0), (_mag_check_stream(), None, 0),
              (None, '36', 0), (_mag_check_stream(), None, 0), (None, 'q', 0)]
-    run = _Check(clock, tmp_path, steps, menu=['12', '4', '12', '4'])
+    run = _Check(clock, tmp_path, steps, menu=['12', '4', '', '12', '4'])
     dip_prompts = [p for p in run.prompts if '磁傾角' in p]
     assert len(dip_prompts) == 2
     assert '上次 30.0' in dip_prompts[1]
@@ -1783,3 +1783,49 @@ def test_notes_follow_the_official_manual():
     assert any('六軸' in n for n in cli.NOTES['5'])
     assert any('官方警告' in n for n in cli.NOTES['6'])
     assert any('選項 13' in n for n in cli.NOTES['7'])
+
+
+# --------------------------------------- results stay on screen until Enter
+
+class _LoggedCheck(_Check):
+    """_Check that also logs every prompt in the output, to see the order."""
+
+    def _input(self, prompt=''):
+        self.lines.append(f'<PROMPT>{prompt}')
+        return super()._input(prompt)
+
+
+MENU_TITLE = '========== CMP10A IMU 校正工具 =========='
+
+
+def _prompt_before_next_menu(run, header):
+    """Return the first prompt after the last ``header`` line, if it comes before the menu."""
+    start = max(i for i, ln in enumerate(run.lines) if header in ln)
+    for ln in run.lines[start:]:
+        if MENU_TITLE in ln:
+            return None
+        if ln.startswith('<PROMPT>'):
+            return ln
+    return None
+
+
+def test_check_results_wait_for_enter_before_the_menu(clock, tmp_path):
+    """Regression: the menu came right after the results and pushed them off the screen."""
+    steps = [(STILL, '', 0), (_gyro_frame(0, 0, 30.0), '', 10.05)]
+    run = _LoggedCheck(clock, tmp_path, steps, entry='3')
+    assert '[不合格] 3. 陀螺儀 轉一圈測試' in run.text
+    prompt = _prompt_before_next_menu(run, '== 檢測結果 ==')
+    assert prompt is not None and '按 Enter 返回選單' in prompt
+
+
+def test_environment_report_waits_for_enter_before_the_menu(clock, tmp_path):
+    run = _LoggedCheck(clock, tmp_path, _env_steps(), menu=['12', '5', 'n'])
+    assert '[合格] 2. 附近有無鐵件' in run.text
+    prompt = _prompt_before_next_menu(run, '== 環境與安裝位置 檢查結果 ==')
+    assert prompt is not None and '按 Enter 返回選單' in prompt
+
+
+def test_environment_check_before_a_calibration_does_not_pause(clock, tmp_path):
+    """Before a calibration the results lead straight into it; no extra Enter."""
+    run = _LoggedCheck(clock, tmp_path, _env_steps(), menu=['3', 'n', 'n'])
+    assert not any('返回選單' in p for p in run.prompts)
