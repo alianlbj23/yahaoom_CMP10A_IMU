@@ -1,5 +1,7 @@
 # yahaoom_CMP10A_IMU
 
+> 📘 **第一次使用?請先看 [tutorial/](tutorial/README.md)。** 裡面有一步一步的教學:USB 裝置命名、讀取資料、安裝方向、校正、ROS 2 整合與磁力計 FAQ。
+
 Yahboom 10 軸 IMU(CMP10A,WitMotion 協定)的 ROS 2 Jazzy Docker 環境:
 讀取 IMU、以 **Foxglove** 或 **RViz2** 可視化,並提供照官方步驟的**校正工具**。
 主機端只需要 Docker 與 Python 3.8 以上,所有操作都從互動選單 `python3 imu.py` 進行,不需要記指令參數。

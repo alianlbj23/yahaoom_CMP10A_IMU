@@ -1,11 +1,42 @@
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# ROS 2 colcon build output
 build/
 install/
 log/
+
 # Local software-calibration results; keep only *.example.yaml in git
 config/*.yaml
 config/launcher.json
 !config/*.example.yaml
+
+# Secrets
 .env
+*.pem
+*.key
+
+# Editor / tool / OS files
+.vscode/
+.idea/
+.serena/
+.DS_Store
+*.swp
+
+# Vendor PC software: runtime logs, recordings and update temp files
+IMU standard  PC software(V6.2.60)/Data/
+IMU standard  PC software(V6.2.60)/Data.txt
+IMU standard  PC software(V6.2.60)/recordFile/
+IMU standard  PC software(V6.2.60)/temp/
+IMU standard  PC software(V6.2.60)/Resources/temp/
+IMU standard  PC software(V6.2.60)/Resources/log.txt
+IMU standard  PC software(V6.2.60)/Resources/*.tmp
+IMU standard  PC software(V6.2.60)/cmdlog.log
+IMU standard  PC software(V6.2.60)/err.txt
+IMU standard  PC software(V6.2.60)/tmpReplce.txt
+IMU standard  PC software(V6.2.60)/tmpUpdate.txt
